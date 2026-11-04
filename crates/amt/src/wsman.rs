@@ -56,6 +56,9 @@ pub struct Client {
     /// The last digest challenge, reused until AMT rejects it (nonces stay valid
     /// for a while), saving the 401 round trip on most calls.
     challenge: Mutex<Option<Challenge>>,
+    /// One request in flight per device: AMT's embedded web server handles very
+    /// few concurrent connections and drops the rest.
+    gate: tokio::sync::Mutex<()>,
 }
 
 impl Client {
@@ -65,6 +68,7 @@ impl Client {
             ep,
             http,
             challenge: Mutex::new(None),
+            gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -79,6 +83,18 @@ impl Client {
     /// Sends one envelope and returns the response body, answering the digest
     /// challenge if AMT asks for one.
     pub async fn send(&self, envelope: &str) -> Result<String> {
+        let _turn = self.gate.lock().await;
+        match self.exchange(envelope).await {
+            // A dropped connection is retried once; AMT closes idle keep-alives.
+            Err(Error::Http(e)) if e.is_connect() || e.is_request() => {
+                tracing::debug!(error = %e, "retrying WS-Man request");
+                self.exchange(envelope).await
+            }
+            other => other,
+        }
+    }
+
+    async fn exchange(&self, envelope: &str) -> Result<String> {
         let cached = self.challenge.lock().expect("challenge lock").clone();
         if let Some(ch) = cached {
             let resp = self.post(envelope, Some(&ch)).await?;
@@ -176,6 +192,153 @@ impl Client {
         ))
         .await
     }
+
+    /// Enumerates every instance of `resource_uri` (WS-Enumeration with
+    /// optimized enumeration, then `Pull` until end of sequence) and returns
+    /// each instance element, tags included.
+    pub async fn enumerate(&self, resource_uri: &str) -> Result<Vec<String>> {
+        let class = resource_uri.rsplit('/').next().unwrap_or(resource_uri);
+        let body = format!(
+            "<n:Enumerate xmlns:n=\"{ENUMERATION}\"><w:OptimizeEnumeration/>\
+<w:MaxElements>{MAX_ELEMENTS}</w:MaxElements></n:Enumerate>"
+        );
+        let mut xml = self
+            .send(&envelope(
+                &format!("{ENUMERATION}/Enumerate"),
+                resource_uri,
+                "",
+                &body,
+            ))
+            .await?;
+        let mut out = Vec::new();
+        // A safety bound: AMT's largest tables (event log) hold a few hundred.
+        for _ in 0..64 {
+            out.extend(elements(&xml, class));
+            if xml.contains("EndOfSequence") {
+                return Ok(out);
+            }
+            let Some(ctx) = field(&xml, "EnumerationContext") else {
+                return Ok(out);
+            };
+            let body = format!(
+                "<n:Pull xmlns:n=\"{ENUMERATION}\"><n:EnumerationContext>{ctx}</n:EnumerationContext>\
+<n:MaxElements>{MAX_ELEMENTS}</n:MaxElements></n:Pull>"
+            );
+            xml = self
+                .send(&envelope(
+                    &format!("{ENUMERATION}/Pull"),
+                    resource_uri,
+                    "",
+                    &body,
+                ))
+                .await?;
+        }
+        Ok(out)
+    }
+}
+
+impl Client {
+    /// `Get` on one instance of a multi-instance class.
+    pub async fn get_with(&self, resource_uri: &str, selectors: &[(&str, &str)]) -> Result<String> {
+        self.send(&envelope(
+            ACTION_GET,
+            resource_uri,
+            &selector_set(selectors),
+            "",
+        ))
+        .await
+    }
+
+    /// `Delete` of one instance.
+    pub async fn delete(&self, resource_uri: &str, selectors: &[(&str, &str)]) -> Result<String> {
+        self.send(&envelope(
+            ACTION_DELETE,
+            resource_uri,
+            &selector_set(selectors),
+            "",
+        ))
+        .await
+    }
+
+    /// `Put` of one instance of a multi-instance class.
+    pub async fn put_with(
+        &self,
+        resource_uri: &str,
+        selectors: &[(&str, &str)],
+        instance_xml: &str,
+    ) -> Result<String> {
+        self.send(&envelope(
+            ACTION_PUT,
+            resource_uri,
+            &selector_set(selectors),
+            instance_xml,
+        ))
+        .await
+    }
+
+    /// [`Client::invoke`] with selectors given as pairs.
+    pub async fn call(
+        &self,
+        resource_uri: &str,
+        method: &str,
+        selectors: &[(&str, &str)],
+        input: &str,
+    ) -> Result<String> {
+        self.invoke(resource_uri, method, &selector_set(selectors), input)
+            .await
+    }
+}
+
+const ACTION_DELETE: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete";
+
+/// A `<w:SelectorSet>`, or nothing for no selectors.
+pub fn selector_set(selectors: &[(&str, &str)]) -> String {
+    if selectors.is_empty() {
+        return String::new();
+    }
+    let inner: String = selectors
+        .iter()
+        .map(|(k, v)| format!("<w:Selector Name=\"{k}\">{}</w:Selector>", escape(v)))
+        .collect();
+    format!("<w:SelectorSet>{inner}</w:SelectorSet>")
+}
+
+/// An endpoint reference to an instance, as method parameters take them. The
+/// caller wraps it in the parameter element (`<p:Source>…</p:Source>`).
+pub fn reference(resource_uri: &str, selectors: &[(&str, &str)]) -> String {
+    format!(
+        "<a:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address>\
+<a:ReferenceParameters><w:ResourceURI>{resource_uri}</w:ResourceURI>{}</a:ReferenceParameters>",
+        selector_set(selectors)
+    )
+}
+
+/// XML-escapes text for a parameter value.
+pub fn xml_text(s: &str) -> String {
+    escape(s)
+}
+
+const ENUMERATION: &str = "http://schemas.xmlsoap.org/ws/2004/09/enumeration";
+const MAX_ELEMENTS: u32 = 100;
+
+/// Every element called `name` (prefix-agnostic), tags included.
+pub fn elements(xml: &str, name: &str) -> Vec<String> {
+    let re = Regex::new(&format!(
+        r"(?s)<((?:[\w-]+:)?{n})(?:\s[^>]*)?>.*?</(?:[\w-]+:)?{n}>",
+        n = regex::escape(name)
+    ))
+    .expect("elements regex");
+    re.find_iter(xml).map(|m| m.as_str().to_string()).collect()
+}
+
+/// The texts of every element called `name` (prefix-agnostic).
+pub fn fields(xml: &str, name: &str) -> Vec<String> {
+    let re = Regex::new(&format!(
+        r"<(?:[\w-]+:)?{}(?:\s[^>]*)?>([^<]*)</",
+        regex::escape(name)
+    ))
+    .expect("fields regex");
+    re.captures_iter(xml).map(|c| unescape(&c[1])).collect()
 }
 
 /// A SOAP envelope for AMT.

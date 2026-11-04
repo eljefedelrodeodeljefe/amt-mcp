@@ -48,6 +48,12 @@ pub enum PowerAction {
     Cycle,
     /// Hard reset without removing power (state 10, "Master Bus Reset").
     Reset,
+    /// Ask the OS to shut down cleanly (state 12, "Off - Soft Graceful").
+    /// Needs Intel's in-band agent in the OS; AMT refuses it otherwise.
+    GracefulOff,
+    /// Ask the OS to restart cleanly (state 14, "Master Bus Reset Graceful").
+    /// Needs Intel's in-band agent in the OS; AMT refuses it otherwise.
+    GracefulReset,
 }
 
 impl PowerAction {
@@ -57,6 +63,8 @@ impl PowerAction {
             Self::Off => 8,
             Self::Cycle => 5,
             Self::Reset => 10,
+            Self::GracefulOff => 12,
+            Self::GracefulReset => 14,
         }
     }
 }
@@ -319,7 +327,7 @@ impl Device {
 }
 
 /// Adds `xmlns:{prefix}="{uri}"` to the root tag of `inst` if it is missing.
-fn declare_prefix(inst: &str, uri: &str) -> String {
+pub(crate) fn declare_prefix(inst: &str, uri: &str) -> String {
     let Some(end) = inst.find('>') else {
         return inst.to_string();
     };
