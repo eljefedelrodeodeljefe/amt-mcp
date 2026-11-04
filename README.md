@@ -8,25 +8,41 @@ Version 0.1.0 <!-- x-release-please-version -->
 
 ## Tools
 
-| Tool | Writes | What it does |
-|------|:------:|--------------|
-| `get_status` | | Power state, control mode, consent state and policy, SOL/IDE-R/listener and KVM settings |
-| `power` | ✓ | `on`, `off`, `cycle` or `reset` — immediate, the OS is not asked |
-| `consent_request` | ✓ | Shows a 6-digit consent code on the device's display |
-| `consent_submit` | ✓ | Submits the code read off the display |
-| `consent_cancel` | ✓ | Withdraws consent |
-| `enable_sol_listener` | ✓ | Opens the 16994 redirection listener SOL needs |
-| `sol_open` | ✓ | Opens a Serial-over-LAN session |
-| `sol_read` | | Returns console output since the last read (ANSI stripped by default) |
-| `sol_send` | ✓ | Types on the console; `escapes=true` for control keys |
-| `sol_close` | | Ends the session |
+Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 
-Write tools are refused unless `AMT_ALLOW_WRITES=true`.
+| Area | Tool | Writes | What it does |
+| --- | --- | :---: | --- |
+| Status | `get_status` | | Power state, control mode, consent, SOL/IDE-R/listener and KVM settings |
+| | `get_inventory` | | BIOS, chassis model/serial, CPUs, memory, AMT version — with the OS down |
+| | `get_network` | | AMT's host name, digest realm, per-port MAC, link, DHCP, address |
+| | `get_event_log` | | Platform events: BIOS/POST progress, firmware errors, boot failures |
+| | `get_audit_log` | | Who used AMT: power actions, SOL/IDE-R/KVM sessions, consent, accounts |
+| Power | `power` | ✓ | `on`, `off`, `cycle`, `reset` (immediate); `graceful_off`, `graceful_reset` (need Intel's OS agent) |
+| | `get_boot_options` | | Boot capabilities and the pending one-time override |
+| | `set_next_boot` | ✓ | Next boot: `bios_setup`, `pxe`, `hard_drive`, `cd_dvd`, `ider_cd`, `ider_floppy`, `default`; optional BIOS console on SOL |
+| Consent | `consent_request` | ✓ | Shows a 6-digit code on the device's display |
+| | `consent_submit` | ✓ | Submits the code read off the display |
+| | `consent_cancel` | ✓ | Withdraws consent |
+| Console | `enable_sol_listener` | ✓ | Opens the 16994 redirection listener |
+| | `sol_open` / `sol_close` | ✓ / | Serial-over-LAN session |
+| | `sol_read` | | Console output since the last read (ANSI stripped by default) |
+| | `sol_send` | ✓ | Types on the console; `escapes=true` for control keys |
+| KVM | `kvm_enable` / `kvm_disable` | ✓ | VNC port 5900 with an RFB password, KVM service on/off |
+| | `kvm_screenshot` | ✓ | The display as a PNG image |
+| | `kvm_send_keys` | ✓ | Text and named keys (`{f2}`, `{enter}`, …) |
+| | `kvm_close` | | Ends the KVM session |
+| Remote disk | `ider_start` | ✓ | Serves a local ISO as the device's CD-ROM (IDE-R) |
+| | `ider_status` / `ider_stop` | | Progress; end the session |
+| Clock & wake | `get_clock` / `sync_clock` | / ✓ | AMT's clock against this machine's; set it |
+| | `list_alarms` / `add_alarm` / `delete_alarm` | / ✓ / ✓ | Scheduled power-on, once or repeating |
+| Accounts | `list_accounts` | | AMT accounts and their realms |
+| | `add_account` / `remove_account` | ✓ | Digest accounts limited to realms (read-only by default) |
+| Guides | `list_guides` / `get_guide` | | Operator guides, also as resources `amt://guide/<name>` |
 
 ## Configuration
 
 | Variable | Default | |
-|----------|---------|--|
+| --- | --- | --- |
 | `AMT_HOST` | — | Device address (AMT shares the host OS's IP in DHCP mode) |
 | `AMT_PASSWORD_FILE` | — | File holding the AMT admin password (preferred) |
 | `AMT_PASSWORD` | — | The password itself, if no file is given |
@@ -34,6 +50,8 @@ Write tools are refused unless `AMT_ALLOW_WRITES=true`.
 | `AMT_PORT` | `16992` | WS-Man (HTTP digest) |
 | `AMT_SOL_PORT` | `16994` | Redirection protocol |
 | `AMT_TIMEOUT_MS` | `15000` | |
+| `AMT_READ_USER` + `AMT_READ_PASSWORD_FILE` | — | A least-privilege account for read tools |
+| `AMT_RFB_PASSWORD_FILE` | — | RFB (VNC) password for KVM, if `kvm_enable` was done earlier |
 | `AMT_ALLOW_WRITES` | `false` | Must be `true` for anything that changes state |
 
 ```json
@@ -59,17 +77,30 @@ Write tools are refused unless `AMT_ALLOW_WRITES=true`.
   and a getty on the AMT SOL serial port (`8086:a363` on recent chipsets shows up as a
   `ttyS*`).
 
+## Guides
+
+The server carries operator guides — [setup](docs/guides/setup.md) (including the steps
+that need a person at the device), [security](docs/guides/security.md),
+[recipes](docs/guides/recipes.md) and [troubleshooting](docs/guides/troubleshooting.md) —
+as MCP resources (`amt://guide/<name>`) and through `list_guides`/`get_guide`.
+
 ## User consent
 
-In client control mode AMT requires consent for every SOL, IDE-R and KVM session, and
-the policy cannot be changed. The code appears **only on the device's own display**, so
-someone has to be there to read it:
+In client control mode AMT requires consent for every SOL, IDE-R and KVM session and
+for forced boot sources, and the policy cannot be changed. The code appears **only on
+the device's own display**, so someone has to be there to read it:
 
 1. `consent_request`
 2. read the code at the device, then `consent_submit`
 3. `sol_open`, `sol_send`, `sol_read`
 
-Power actions need no consent.
+Power actions, reads and clearing a boot override need no consent.
+
+## Known limits
+
+- KVM: with a 3840x2160 display, AMT 12 accepts the session but resets on the first
+  framebuffer request. Lower the display or console resolution.
+- `add_alarm`: start times must be before 2038 (AMT's clock is 32-bit).
 
 ## Security
 
@@ -84,6 +115,9 @@ cargo test --all
 AMT_HOST=… AMT_PASSWORD_FILE=… cargo run -p amt --example probe     # read-only status
 AMT_HOST=… AMT_PASSWORD_FILE=… cargo run -p amt --example console -- request
 AMT_HOST=… AMT_PASSWORD_FILE=… cargo run -p amt --example console -- open <code>
+AMT_HOST=… AMT_PASSWORD_FILE=… cargo run -p amt --example reads      # every read call
+AMT_HOST=… AMT_PASSWORD_FILE=… cargo run -p amt --example writes     # reversible writes
+AMT_HOST=… AMT_PASSWORD_FILE=… cargo run -p amt --example wsman -- get CIM_Chassis
 ```
 
 ## License

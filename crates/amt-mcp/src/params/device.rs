@@ -79,3 +79,11 @@ pub struct NextBootParams {
     )]
     pub sol: Option<bool>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GuideParams {
+    #[schemars(
+        description = "Guide name from list_guides: setup, security, recipes, troubleshooting"
+    )]
+    pub name: String,
+}
