@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use amt::{Client, Device, Endpoint, SolSession};
+use amt::{Client, Device, Endpoint, IderSession, KvmSession, SolSession};
 use anyhow::Context;
+use base64::Engine;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -26,6 +27,10 @@ pub struct AmtServer {
     writes_enabled: bool,
     /// At most one SOL session per process; AMT allows one per device anyway.
     sol: Mutex<Option<SolSession>>,
+    kvm: Mutex<Option<KvmSession>>,
+    /// The RFB password set by kvm_enable, or read from AMT_RFB_PASSWORD_FILE.
+    rfb_password: Mutex<Option<String>>,
+    ider: Mutex<Option<IderSession>>,
 }
 
 impl AmtServer {
@@ -82,6 +87,12 @@ impl AmtServer {
             timeout,
             writes_enabled,
             sol: Mutex::new(None),
+            kvm: Mutex::new(None),
+            rfb_password: Mutex::new(match std::env::var("AMT_RFB_PASSWORD_FILE") {
+                Ok(path) => Some(read_secret(&path, "AMT_RFB_PASSWORD_FILE")?),
+                Err(_) => None,
+            }),
+            ider: Mutex::new(None),
         })
     }
 
@@ -106,6 +117,28 @@ impl AmtServer {
                 None,
             ))
         }
+    }
+
+    /// The KVM session, opened on first use with the known RFB password.
+    async fn kvm_session(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<KvmSession>>, ErrorData> {
+        let mut slot = self.kvm.lock().await;
+        if slot.is_none() {
+            let pw = self.rfb_password.lock().await.clone().ok_or_else(|| {
+                ErrorData::new(
+                    ErrorCode::INVALID_REQUEST,
+                    "no RFB password known — call kvm_enable or set AMT_RFB_PASSWORD_FILE",
+                    None,
+                )
+            })?;
+            let host = self.device.client().endpoint().host.clone();
+            let session = KvmSession::open(&host, amt::kvm::VNC_PORT, &pw, self.timeout)
+                .await
+                .map_err(|e| tool_error(e.into()))?;
+            *slot = Some(session);
+        }
+        Ok(slot)
     }
 
     fn no_session() -> ErrorData {
@@ -424,6 +457,160 @@ impl AmtServer {
         }
         Ok(Self::ok(&serde_json::json!({ "closed": was_open })))
     }
+
+    // ── KVM ───────────────────────────────────────────────────────────────────
+
+    #[tool(
+        description = "Enable KVM on the standard VNC port: set the RFB password (IPS_KVMRedirectionSettingData Is5900PortEnabled/RFBPassword) and enable the KVM service (CIM_KVMRedirectionSAP.RequestStateChange 2). The password is read from a file"
+    )]
+    async fn kvm_enable(
+        &self,
+        Parameters(p): Parameters<KvmEnableParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let pw = read_secret(&p.rfb_password_file, "rfb_password_file").map_err(tool_error)?;
+        let state = self
+            .device
+            .enable_kvm(&pw)
+            .await
+            .map_err(|e| tool_error(e.into()))?;
+        *self.rfb_password.lock().await = Some(pw);
+        Ok(Self::ok(&serde_json::to_value(state).unwrap_or_default()))
+    }
+
+    #[tool(
+        description = "Close the VNC port and disable the KVM service (CIM_KVMRedirectionSAP.RequestStateChange 3)"
+    )]
+    async fn kvm_disable(&self) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        if let Some(k) = self.kvm.lock().await.take() {
+            k.close().await;
+        }
+        let state = self
+            .device
+            .disable_kvm()
+            .await
+            .map_err(|e| tool_error(e.into()))?;
+        Ok(Self::ok(&serde_json::to_value(state).unwrap_or_default()))
+    }
+
+    #[tool(
+        description = "Screenshot of the device's display over KVM (RFB on 5900), returned as a PNG image: BIOS setup, boot loader, installer or desktop. Opens the KVM session on first use. In client control mode grant user consent first"
+    )]
+    async fn kvm_screenshot(&self) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let mut slot = self.kvm_session().await?;
+        let kvm = slot.as_mut().ok_or_else(Self::no_session)?;
+        match kvm.screenshot().await {
+            Ok(png) => {
+                let (w, h) = kvm.size();
+                Ok(CallToolResult::success(vec![
+                    Content::image(
+                        base64::engine::general_purpose::STANDARD.encode(&png),
+                        "image/png",
+                    ),
+                    Content::text(format!("{w}x{h}")),
+                ]))
+            }
+            Err(e) => {
+                *slot = None;
+                Err(tool_error(e.into()))
+            }
+        }
+    }
+
+    #[tool(
+        description = "Type on the device's keyboard over KVM. Text plus named keys in braces, e.g. \"{f1}\" to enter BIOS setup or \"root{enter}\". Follow with kvm_screenshot"
+    )]
+    async fn kvm_send_keys(
+        &self,
+        Parameters(p): Parameters<KvmKeysParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let keys = amt::kvm::keysyms(&p.keys).map_err(|e| tool_error(e.into()))?;
+        let mut slot = self.kvm_session().await?;
+        let kvm = slot.as_mut().ok_or_else(Self::no_session)?;
+        if let Err(e) = kvm.keys(&keys).await {
+            *slot = None;
+            return Err(tool_error(e.into()));
+        }
+        Ok(Self::ok(&serde_json::json!({ "keys_sent": keys.len() })))
+    }
+
+    #[tool(description = "Close the KVM session (the VNC port stays enabled)")]
+    async fn kvm_close(&self) -> Result<CallToolResult, ErrorData> {
+        let was_open = match self.kvm.lock().await.take() {
+            Some(k) => {
+                k.close().await;
+                true
+            }
+            None => false,
+        };
+        Ok(Self::ok(&serde_json::json!({ "closed": was_open })))
+    }
+
+    // ── IDE-R ─────────────────────────────────────────────────────────────────
+
+    #[tool(
+        description = "Serve a local ISO to the device as a CD-ROM over IDE redirection (redirection protocol, session IDER). Typical boot: consent_request/consent_submit, ider_start (on_reboot), set_next_boot ider_cd, power reset. The session keeps running until ider_stop"
+    )]
+    async fn ider_start(
+        &self,
+        Parameters(p): Parameters<IderStartParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let mut slot = self.ider.lock().await;
+        if let Some(s) = slot.as_ref()
+            && s.status().await.closed.is_none()
+        {
+            return Err(ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                "an IDE-R session is already running — ider_stop first",
+                None,
+            ));
+        }
+        let session = IderSession::open(
+            self.device.client().endpoint(),
+            self.sol_port,
+            std::path::Path::new(&p.iso_path),
+            p.start.unwrap_or(amt::IderStart::OnReboot),
+            self.timeout,
+        )
+        .await
+        .map_err(|e| tool_error(e.into()))?;
+        let status = session.status().await;
+        *slot = Some(session);
+        Ok(Self::ok(&serde_json::to_value(status).unwrap_or_default()))
+    }
+
+    #[tool(
+        description = "IDE-R session progress: whether AMT enabled the drive, commands handled, blocks read, resets, and why it closed"
+    )]
+    async fn ider_status(&self) -> Result<CallToolResult, ErrorData> {
+        let slot = self.ider.lock().await;
+        let s = slot.as_ref().ok_or_else(|| {
+            ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                "no IDE-R session — call ider_start first",
+                None,
+            )
+        })?;
+        Ok(Self::ok(
+            &serde_json::to_value(s.status().await).unwrap_or_default(),
+        ))
+    }
+
+    #[tool(description = "End the IDE-R session; the device loses the CD-ROM")]
+    async fn ider_stop(&self) -> Result<CallToolResult, ErrorData> {
+        let was_open = match self.ider.lock().await.take() {
+            Some(s) => {
+                s.close().await;
+                true
+            }
+            None => false,
+        };
+        Ok(Self::ok(&serde_json::json!({ "stopped": was_open })))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -439,13 +626,20 @@ const INSTRUCTIONS: &str = concat!(
     "redirection protocol (Serial-over-LAN, port 16994). Configure with AMT_HOST and ",
     "AMT_PASSWORD_FILE (or AMT_PASSWORD). Optional: AMT_USER (default admin), AMT_PORT, ",
     "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_READ_USER + AMT_READ_PASSWORD_FILE ",
-    "(a least-privilege account used for read tools), AMT_ALLOW_WRITES (default false — must ",
+    "(a least-privilege account used for read tools), AMT_RFB_PASSWORD_FILE (KVM), AMT_ALLOW_WRITES (default false — must ",
     "be 'true' for power, consent and console tools). ",
     "Power actions are immediate and bypass the OS. In client control mode every SOL, ",
     "IDE-R or KVM session needs a 6-digit consent code that only someone at the device's ",
     "display can read: call consent_request, ask the user for the code, then ",
     "consent_submit, then sol_open.",
 );
+
+fn read_secret(path: &str, what: &str) -> anyhow::Result<String> {
+    Ok(std::fs::read_to_string(path)
+        .with_context(|| format!("reading {what} {path}"))?
+        .trim_end_matches(['\r', '\n'])
+        .to_string())
+}
 
 fn env_port(key: &str, default: u16) -> anyhow::Result<u16> {
     match std::env::var(key) {
