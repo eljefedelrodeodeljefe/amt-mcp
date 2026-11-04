@@ -18,6 +18,9 @@ use crate::tools;
 pub struct AmtServer {
     tool_router: ToolRouter<Self>,
     device: Device,
+    /// Least-privilege account for read tools, if configured
+    /// (AMT_READ_USER + AMT_READ_PASSWORD_FILE). Falls back to `device`.
+    reader: Option<Device>,
     sol_port: u16,
     timeout: Duration,
     writes_enabled: bool,
@@ -50,18 +53,41 @@ impl AmtServer {
             .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
 
-        let mut ep = Endpoint::new(host, user, password);
+        let mut ep = Endpoint::new(host.clone(), user, password);
         ep.port = port;
         ep.timeout = Duration::from_millis(timeout_ms);
         let timeout = ep.timeout;
+        let reader = match (
+            std::env::var("AMT_READ_USER"),
+            std::env::var("AMT_READ_PASSWORD_FILE"),
+        ) {
+            (Ok(u), Ok(path)) => {
+                let p = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading AMT_READ_PASSWORD_FILE {path}"))?
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
+                let mut r = Endpoint::new(host, u, p);
+                r.port = port;
+                r.timeout = timeout;
+                Some(Device::new(Client::new(r)?))
+            }
+            (Err(_), Err(_)) => None,
+            _ => anyhow::bail!("AMT_READ_USER and AMT_READ_PASSWORD_FILE must be set together"),
+        };
         Ok(Self {
             tool_router: Self::tool_router(),
             device: Device::new(Client::new(ep)?),
+            reader,
             sol_port,
             timeout,
             writes_enabled,
             sol: Mutex::new(None),
         })
+    }
+
+    /// The device handle for read-only tools.
+    fn reads(&self) -> &Device {
+        self.reader.as_ref().unwrap_or(&self.device)
     }
 
     fn ok(value: &Value) -> CallToolResult {
@@ -99,7 +125,174 @@ impl AmtServer {
         description = "Get the device's power state (CIM_AssociatedPowerManagementService), control mode (IPS_HostBasedSetupService), user-consent state and policy (IPS_OptInService), redirection (AMT_RedirectionService: SOL, IDE-R, listener) and KVM settings (IPS_KVMRedirectionSettingData)"
     )]
     async fn get_status(&self) -> Result<CallToolResult, ErrorData> {
-        let data = tools::device::status(&self.device)
+        let data = tools::device::status(self.reads())
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "Hardware inventory read out of band: BIOS (CIM_BIOSElement), chassis model and serial (CIM_Chassis), CPUs (CIM_Processor), memory modules (CIM_PhysicalMemory), AMT firmware version (CIM_SoftwareIdentity). Works with the OS down"
+    )]
+    async fn get_inventory(&self) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::inventory(self.reads())
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "AMT network view: host name, digest realm, ping response (AMT_GeneralSettings) and per-port MAC, link, DHCP, address and whether AMT shares the host's MAC/IP (AMT_EthernetPortSettings). Read-only"
+    )]
+    async fn get_network(&self) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::network(self.reads())
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "AMT's clock against this machine's (AMT_TimeSynchronizationService.GetLowAccuracyTimeSynch). Event and audit log times use AMT's clock"
+    )]
+    async fn get_clock(&self) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::clock(self.reads())
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "Platform event log (AMT_MessageLog.GetRecords): BIOS/POST progress, firmware errors, boot failures, watchdog, newest last. Times are AMT-clock Unix seconds"
+    )]
+    async fn get_event_log(
+        &self,
+        Parameters(p): Parameters<LogParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::event_log(self.reads(), p.limit)
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "Audit log (AMT_AuditLog.ReadRecords): who used AMT and how — power actions, SOL/IDE-R/KVM sessions, consent codes, account and TLS changes — with the initiating user and address, newest last"
+    )]
+    async fn get_audit_log(
+        &self,
+        Parameters(p): Parameters<LogParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::audit_log(self.reads(), p.limit)
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(description = "Scheduled wake alarms (IPS_AlarmClockOccurrence)")]
+    async fn list_alarms(&self) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::alarms(self.reads())
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "AMT user accounts besides the built-in admin, with their realms (AMT_AuthorizationService.EnumerateUserAclEntries / GetUserAclEntryEx)"
+    )]
+    async fn list_accounts(&self) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::accounts(self.reads())
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "Boot capabilities (AMT_BootCapabilities: BIOS setup, PXE, hard drive, CD/DVD, IDE-R, SOL) and the pending one-time boot override (AMT_BootSettingData)"
+    )]
+    async fn get_boot_options(&self) -> Result<CallToolResult, ErrorData> {
+        let data = tools::device::boot_options(self.reads())
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    // ── Clock, alarms, accounts ───────────────────────────────────────────────
+
+    #[tool(
+        description = "Set AMT's clock to this machine's (AMT_TimeSynchronizationService.SetHighAccuracyTimeSynch)"
+    )]
+    async fn sync_clock(&self) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let data = tools::device::sync_clock(&self.device)
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "Schedule a wake: AMT powers the machine on at a UTC time, once or repeating (AMT_AlarmClockService.AddAlarm). Confirm with the user first"
+    )]
+    async fn add_alarm(
+        &self,
+        Parameters(p): Parameters<AddAlarmParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let data = tools::device::add_alarm(&self.device, &p)
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(description = "Delete a scheduled wake alarm (IPS_AlarmClockOccurrence Delete)")]
+    async fn delete_alarm(
+        &self,
+        Parameters(p): Parameters<AlarmNameParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let data = tools::device::delete_alarm(&self.device, &p.name)
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "Add an AMT digest account limited to the given realms (AMT_AuthorizationService.AddUserAclEntryEx). Omit realms for a read-only monitoring account. The password is read from password_file, never passed in the conversation"
+    )]
+    async fn add_account(
+        &self,
+        Parameters(p): Parameters<AddAccountParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let data = tools::device::add_account(&self.device, &p)
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    #[tool(
+        description = "Remove an AMT account by handle (AMT_AuthorizationService.RemoveUserAclEntry)"
+    )]
+    async fn remove_account(
+        &self,
+        Parameters(p): Parameters<AccountHandleParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let data = tools::device::remove_account(&self.device, p.handle)
+            .await
+            .map_err(tool_error)?;
+        Ok(Self::ok(&data))
+    }
+
+    // ── Boot ──────────────────────────────────────────────────────────────────
+
+    #[tool(
+        description = "Set a one-time boot override: bios_setup, pxe, hard_drive, cd_dvd, ider_cd, ider_floppy, or default to clear it; sol=true redirects the BIOS console to SOL (AMT_BootSettingData Put, CIM_BootService.SetBootConfigRole, CIM_BootConfigSetting.ChangeBootOrder). Does not reboot — follow with power. In client control mode, forced sources need user consent first"
+    )]
+    async fn set_next_boot(
+        &self,
+        Parameters(p): Parameters<NextBootParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.guard_write()?;
+        let data = tools::device::set_next_boot(&self.device, &p)
             .await
             .map_err(tool_error)?;
         Ok(Self::ok(&data))
@@ -108,7 +301,7 @@ impl AmtServer {
     // ── Power ─────────────────────────────────────────────────────────────────
 
     #[tool(
-        description = "Out-of-band power action (CIM_PowerManagementService.RequestPowerStateChange): on, off, cycle or reset. Immediate and not graceful: the OS is not asked to shut down. Needs no user consent. Read get_status and confirm with the user first"
+        description = "Out-of-band power action (CIM_PowerManagementService.RequestPowerStateChange): on, off, cycle, reset (immediate, the OS is not asked) or graceful_off, graceful_reset (the OS is asked to shut down; needs Intel's in-band agent in the OS, refused otherwise). Needs no user consent. Read get_status and confirm with the user first"
     )]
     async fn power(
         &self,
@@ -245,7 +438,8 @@ const INSTRUCTIONS: &str = concat!(
     "Intel AMT out-of-band management over WS-Man (HTTP digest, port 16992) and the ",
     "redirection protocol (Serial-over-LAN, port 16994). Configure with AMT_HOST and ",
     "AMT_PASSWORD_FILE (or AMT_PASSWORD). Optional: AMT_USER (default admin), AMT_PORT, ",
-    "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_ALLOW_WRITES (default false — must ",
+    "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_READ_USER + AMT_READ_PASSWORD_FILE ",
+    "(a least-privilege account used for read tools), AMT_ALLOW_WRITES (default false — must ",
     "be 'true' for power, consent and console tools). ",
     "Power actions are immediate and bypass the OS. In client control mode every SOL, ",
     "IDE-R or KVM session needs a 6-digit consent code that only someone at the device's ",

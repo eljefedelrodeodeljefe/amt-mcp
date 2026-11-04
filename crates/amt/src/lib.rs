@@ -3,16 +3,28 @@
 //!
 //! No MCP types live here; the library stands on its own.
 
+pub mod accounts;
+pub mod alarm;
+pub mod boot;
 pub mod device;
 mod digest;
 pub mod error;
+pub mod inventory;
+pub mod logs;
+pub mod network;
 pub mod sol;
 pub mod wsman;
 
+pub use accounts::{Account, READ_ONLY_REALMS, Realm};
+pub use alarm::Alarm;
+pub use boot::{BootCapabilities, BootSettings, BootTarget};
 pub use device::{
     ConsentPolicy, ConsentState, ControlMode, Device, Kvm, PowerAction, PowerState, Redirection,
     Status,
 };
 pub use error::{Error, Result};
+pub use inventory::{GeneralSettings, Inventory};
+pub use logs::{AuditRecord, Event};
+pub use network::{Clock, EthernetPort};
 pub use sol::SolSession;
 pub use wsman::{Client, Endpoint};
