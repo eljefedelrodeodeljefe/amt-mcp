@@ -45,7 +45,8 @@ takes effect at the next boot.
 2. `set_next_boot` `bios_setup` (`sol=true` to redirect the BIOS console to SOL, if
    the BIOS supports it).
 3. `power` `reset` (or `on` if off).
-4. With `sol=true`: `sol_open` and read the BIOS menus. Otherwise `kvm_screenshot`.
+4. With `sol=true`: `sol_open` and read the BIOS menus. Otherwise `kvm_enable` once,
+   then `kvm_screenshot` and `kvm_send_keys`.
 
 ## Reinstall from an ISO with no physical media
 

@@ -23,6 +23,7 @@ version = "0.1.0"
 dependencies = [
  "amt-fake",
  "des",
+ "flate2",
  "hex",
  "md-5",
  "png",

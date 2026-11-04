@@ -49,6 +49,8 @@ when enabled, keyboard, screen and disk access. Treat its ports like a BMC's.
 ## Hygiene
 
 - Disable KVM (`kvm_disable`) when not in use; it is the most powerful feature.
+- KVM over the redirection port needs no VNC port: leave 5900 closed unless a plain
+  VNC client must connect.
 - Review the audit log (`get_audit_log`): power actions, SOL/IDE-R/KVM sessions,
   consent codes and account changes, with the initiating user and address.
 - `power` is the physical power button. Confirm before using it.

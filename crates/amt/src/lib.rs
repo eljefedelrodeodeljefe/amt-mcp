@@ -17,6 +17,7 @@ pub mod network;
 mod redir;
 pub mod sol;
 pub mod wsman;
+mod zrle;
 
 pub use accounts::{Account, READ_ONLY_REALMS, Realm};
 pub use alarm::Alarm;

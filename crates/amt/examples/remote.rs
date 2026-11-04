@@ -4,6 +4,7 @@
 //!   remote request
 //!   remote run <code> <rfb-password-file> <screenshot.png> <cd-image> <seconds>
 //!   remote kvm <rfb-password-file> <screenshot.png>   (consent already granted)
+//!   remote kvmr <screenshot.png> [code]             (KVM over the redirection port)
 //!
 //! `run` submits the code, sets and clears a PXE boot override, enables KVM and
 //! saves a screenshot, then serves <cd-image> over IDE-R with start=now for
@@ -90,6 +91,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => println!("ider: FAILED {e}"),
             }
             println!("consent at end: {:?}", d.consent_state().await?);
+        }
+        Some("kvmr") if args.len() >= 2 => {
+            if let Some(code) = args.get(2) {
+                d.consent_submit(code).await?;
+            }
+            println!("consent: {:?}", d.consent_state().await?);
+            let mut k =
+                KvmSession::open_redirection(&ep, amt::sol::DEFAULT_PORT, Duration::from_secs(20))
+                    .await?;
+            println!("kvm (redirection) session: {:?}", k.size());
+            let png = k.screenshot().await?;
+            std::fs::write(&args[1], &png)?;
+            println!(
+                "screenshot: {} bytes -> {} at {:?}",
+                png.len(),
+                args[1],
+                k.size()
+            );
+            k.close().await;
         }
         Some("kvm") if args.len() == 3 => {
             println!("consent: {:?}", d.consent_state().await?);
