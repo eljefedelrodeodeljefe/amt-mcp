@@ -3,13 +3,13 @@ resolver = "3"
 members = ["crates/amt", "crates/amt-mcp", "crates/amt-fake"]
 
 [workspace.package]
-version = "0.1.0" # x-release-please-version
+version = "0.2.0" # x-release-please-version
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/eljefedelrodeodeljefe/amt-mcp"
 
 [workspace.dependencies]
-amt = { path = "crates/amt", version = "0.1.0" } # x-release-please-version
+amt = { path = "crates/amt", version = "0.2.0" } # x-release-please-version
 amt-fake = { path = "crates/amt-fake" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -4,7 +4,7 @@ An [MCP](https://modelcontextprotocol.io) server for **Intel AMT** (vPro) out-of
 management: power control, user consent, and a Serial-over-LAN console, over AMT's own
 protocols. No MPS, MeshCentral or agent on the target is needed.
 
-Version 0.1.0 <!-- x-release-please-version -->
+Version 0.2.0 <!-- x-release-please-version -->
 
 ## Tools
 

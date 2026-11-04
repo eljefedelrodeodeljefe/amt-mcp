@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "amt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amt-fake",
  "des",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "amt-fake"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "md-5",
@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "amt-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "amt",
  "anyhow",
