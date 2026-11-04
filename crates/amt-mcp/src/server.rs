@@ -4,15 +4,21 @@ use amt::{Client, Device, Endpoint, IderSession, KvmSession, SolSession};
 use anyhow::Context;
 use base64::Engine;
 use rmcp::{
-    ServerHandler,
+    RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ErrorCode, ErrorData, ServerCapabilities, ServerInfo},
+    model::{
+        AnnotateAble, CallToolResult, Content, ErrorCode, ErrorData, ListResourcesResult,
+        PaginatedRequestParams, RawResource, ReadResourceRequestParams, ReadResourceResult,
+        ResourceContents, ServerCapabilities, ServerInfo,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::error::tool_error;
+use crate::guides;
 use crate::params::*;
 use crate::tools;
 
@@ -331,6 +337,32 @@ impl AmtServer {
         Ok(Self::ok(&data))
     }
 
+    #[tool(
+        description = "List the operator guides (setup, security, recipes, troubleshooting). Read them before provisioning, before exposing AMT on a network, or when a step fails; they mark the steps that need a person at the device"
+    )]
+    async fn list_guides(&self) -> Result<CallToolResult, ErrorData> {
+        let list: Vec<Value> = guides::GUIDES
+            .iter()
+            .map(|g| serde_json::json!({ "name": g.name, "title": g.title, "description": g.description }))
+            .collect();
+        Ok(Self::ok(&serde_json::json!({ "guides": list })))
+    }
+
+    #[tool(description = "Read one operator guide in full (markdown)")]
+    async fn get_guide(
+        &self,
+        Parameters(p): Parameters<GuideParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let g = guides::find(&p.name).ok_or_else(|| {
+            ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                format!("no guide {:?}; see list_guides", p.name),
+                None,
+            )
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(g.text)]))
+    }
+
     // ── Power ─────────────────────────────────────────────────────────────────
 
     #[tool(
@@ -616,8 +648,53 @@ impl AmtServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AmtServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(INSTRUCTIONS)
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let resources = guides::GUIDES
+            .iter()
+            .map(|g| {
+                RawResource::new(format!("{}{}", guides::URI_PREFIX, g.name), g.name)
+                    .with_title(g.title)
+                    .with_description(g.description)
+                    .with_mime_type("text/markdown")
+                    .no_annotation()
+            })
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        let g = guides::find(&request.uri).ok_or_else(|| {
+            ErrorData::new(
+                ErrorCode::INVALID_PARAMS,
+                format!("no resource {}", request.uri),
+                None,
+            )
+        })?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::TextResourceContents {
+                uri: request.uri,
+                mime_type: Some("text/markdown".into()),
+                text: g.text.to_string(),
+                meta: None,
+            },
+        ]))
     }
 }
 
@@ -631,7 +708,9 @@ const INSTRUCTIONS: &str = concat!(
     "Power actions are immediate and bypass the OS. In client control mode every SOL, ",
     "IDE-R or KVM session needs a 6-digit consent code that only someone at the device's ",
     "display can read: call consent_request, ask the user for the code, then ",
-    "consent_submit, then sol_open.",
+    "consent_submit, then sol_open. ",
+    "Operator guides (setup incl. steps that need a human, security, recipes, troubleshooting): ",
+    "list_guides / get_guide, also as resources amt://guide/<name>.",
 );
 
 fn read_secret(path: &str, what: &str) -> anyhow::Result<String> {
