@@ -9,9 +9,12 @@ pub mod boot;
 pub mod device;
 mod digest;
 pub mod error;
+pub mod ider;
 pub mod inventory;
+pub mod kvm;
 pub mod logs;
 pub mod network;
+mod redir;
 pub mod sol;
 pub mod wsman;
 
@@ -23,7 +26,9 @@ pub use device::{
     Status,
 };
 pub use error::{Error, Result};
+pub use ider::{IderSession, IderStart, IderStatus};
 pub use inventory::{GeneralSettings, Inventory};
+pub use kvm::{KvmSession, KvmState};
 pub use logs::{AuditRecord, Event};
 pub use network::{Clock, EthernetPort};
 pub use sol::SolSession;

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 amt = { workspace = true, features = ["schemars"] }
+base64 = "0.22"
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { workspace = true }
 serde = { workspace = true }
