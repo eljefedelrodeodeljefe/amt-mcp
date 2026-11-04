@@ -1,0 +1,10 @@
+# Source-code spell checking (crate-ci/typos).
+
+[default.extend-words]
+# Intel AMT vocabulary: "IDER" is IDE Redirection, not a misspelling.
+ider = "ider"
+IDER = "IDER"
+
+[files]
+# Generated files: release-please owns CHANGELOG.md, cargo owns Cargo.lock.
+extend-exclude = ["CHANGELOG.md", "Cargo.lock"]

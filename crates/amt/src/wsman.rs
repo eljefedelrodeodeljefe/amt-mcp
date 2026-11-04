@@ -1,0 +1,315 @@
+//! WS-Management over HTTP digest on port 16992 — the request/response half of
+//! Intel AMT. Envelopes are built as strings and responses read with
+//! [`field`]: AMT's XML is flat enough that a full XML stack buys nothing.
+
+use std::sync::Mutex;
+use std::time::Duration;
+
+use regex::Regex;
+use reqwest::StatusCode;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
+
+use crate::digest::Challenge;
+use crate::error::{Error, Result};
+
+pub const DEFAULT_PORT: u16 = 16992;
+const PATH: &str = "/wsman";
+
+/// Resource URI prefixes, as the AMT SDK spells them.
+pub const CIM: &str = "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/";
+pub const AMT: &str = "http://intel.com/wbem/wscim/1/amt-schema/1/";
+pub const IPS: &str = "http://intel.com/wbem/wscim/1/ips-schema/1/";
+
+const ACTION_GET: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Get";
+const ACTION_PUT: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Put";
+
+/// Where and how to reach one AMT device.
+#[derive(Debug, Clone)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub timeout: Duration,
+}
+
+impl Endpoint {
+    pub fn new(
+        host: impl Into<String>,
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port: DEFAULT_PORT,
+            user: user.into(),
+            password: password.into(),
+            timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+/// A WS-Man client for one device. Cheap to share: requests are independent.
+pub struct Client {
+    ep: Endpoint,
+    http: reqwest::Client,
+    /// The last digest challenge, reused until AMT rejects it (nonces stay valid
+    /// for a while), saving the 401 round trip on most calls.
+    challenge: Mutex<Option<Challenge>>,
+}
+
+impl Client {
+    pub fn new(ep: Endpoint) -> Result<Self> {
+        let http = reqwest::Client::builder().timeout(ep.timeout).build()?;
+        Ok(Self {
+            ep,
+            http,
+            challenge: Mutex::new(None),
+        })
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.ep
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}:{}{PATH}", self.ep.host, self.ep.port)
+    }
+
+    /// Sends one envelope and returns the response body, answering the digest
+    /// challenge if AMT asks for one.
+    pub async fn send(&self, envelope: &str) -> Result<String> {
+        let cached = self.challenge.lock().expect("challenge lock").clone();
+        if let Some(ch) = cached {
+            let resp = self.post(envelope, Some(&ch)).await?;
+            if resp.status() != StatusCode::UNAUTHORIZED {
+                return Self::body(resp).await;
+            }
+            // Stale nonce: fall through and take the fresh challenge.
+            let fresh = Self::challenge_of(&resp)?;
+            *self.challenge.lock().expect("challenge lock") = Some(fresh.clone());
+            return Self::body(self.post(envelope, Some(&fresh)).await?).await;
+        }
+        let first = self.post(envelope, None).await?;
+        if first.status() != StatusCode::UNAUTHORIZED {
+            return Self::body(first).await;
+        }
+        let ch = Self::challenge_of(&first)?;
+        *self.challenge.lock().expect("challenge lock") = Some(ch.clone());
+        Self::body(self.post(envelope, Some(&ch)).await?).await
+    }
+
+    async fn post(&self, envelope: &str, ch: Option<&Challenge>) -> Result<reqwest::Response> {
+        let mut req = self
+            .http
+            .post(self.url())
+            .header(CONTENT_TYPE, "application/soap+xml;charset=UTF-8")
+            .body(envelope.to_string());
+        if let Some(ch) = ch {
+            req = req.header(
+                AUTHORIZATION,
+                ch.authorization(&self.ep.user, &self.ep.password, "POST", PATH),
+            );
+        }
+        Ok(req.send().await?)
+    }
+
+    fn challenge_of(resp: &reqwest::Response) -> Result<Challenge> {
+        let status = resp.status().as_u16();
+        resp.headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(Challenge::parse)
+            .ok_or(Error::NoChallenge { status })
+    }
+
+    async fn body(resp: reqwest::Response) -> Result<String> {
+        let status = resp.status();
+        let text = resp.text().await?;
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(Error::Unauthorized {
+                status: status.as_u16(),
+            });
+        }
+        if let Some(reason) = fault_reason(&text) {
+            return Err(Error::Fault(reason));
+        }
+        if !status.is_success() {
+            return Err(Error::HttpStatus {
+                status: status.as_u16(),
+                body: text.chars().take(300).collect(),
+            });
+        }
+        Ok(text)
+    }
+
+    /// `Get` on a singleton resource.
+    pub async fn get(&self, resource_uri: &str) -> Result<String> {
+        self.send(&envelope(ACTION_GET, resource_uri, "", "")).await
+    }
+
+    /// `Put` of a whole instance. `instance_xml` is the body element, which must
+    /// declare its own namespace prefix.
+    pub async fn put(&self, resource_uri: &str, instance_xml: &str) -> Result<String> {
+        self.send(&envelope(ACTION_PUT, resource_uri, "", instance_xml))
+            .await
+    }
+
+    /// Invokes `method` on `resource_uri` (action `{resource_uri}/{method}`).
+    /// `selectors` is a pre-built `<w:SelectorSet>` or empty, `input` the
+    /// contents of `<p:{method}_INPUT>`.
+    pub async fn invoke(
+        &self,
+        resource_uri: &str,
+        method: &str,
+        selectors: &str,
+        input: &str,
+    ) -> Result<String> {
+        let body =
+            format!("<p:{method}_INPUT xmlns:p=\"{resource_uri}\">{input}</p:{method}_INPUT>");
+        self.send(&envelope(
+            &format!("{resource_uri}/{method}"),
+            resource_uri,
+            selectors,
+            &body,
+        ))
+        .await
+    }
+}
+
+/// A SOAP envelope for AMT.
+pub fn envelope(action: &str, resource_uri: &str, selectors: &str, body: &str) -> String {
+    let id: u32 = rand::random();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\" \
+xmlns:a=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" \
+xmlns:w=\"http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd\">\
+<Header><a:Action>{action}</a:Action><a:To>/wsman</a:To>\
+<w:ResourceURI>{resource_uri}</w:ResourceURI><a:MessageID>{id}</a:MessageID>\
+<a:ReplyTo><a:Address>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:Address></a:ReplyTo>\
+<w:OperationTimeout>PT60S</w:OperationTimeout>{selectors}</Header><Body>{body}</Body></Envelope>"
+    )
+}
+
+/// A `<w:SelectorSet>` with one `Name` selector.
+pub fn name_selector(name: &str) -> String {
+    format!(
+        "<w:SelectorSet><w:Selector Name=\"Name\">{}</w:Selector></w:SelectorSet>",
+        escape(name)
+    )
+}
+
+/// The text of the first element called `name`, whatever its namespace prefix.
+pub fn field(xml: &str, name: &str) -> Option<String> {
+    let re = Regex::new(&format!(
+        r"<(?:[\w-]+:)?{}(?:\s[^>]*)?>([^<]*)</",
+        regex::escape(name)
+    ))
+    .expect("field regex");
+    re.captures(xml).map(|c| unescape(&c[1]))
+}
+
+/// The whole first element called `name` (prefix-agnostic), tags included.
+pub fn element(xml: &str, name: &str) -> Option<String> {
+    let re = Regex::new(&format!(
+        r"(?s)<((?:[\w-]+:)?{n})(?:\s[^>]*)?>.*?</(?:[\w-]+:)?{n}>",
+        n = regex::escape(name)
+    ))
+    .expect("element regex");
+    re.find(xml).map(|m| m.as_str().to_string())
+}
+
+/// `field` parsed as a number.
+pub fn field_u32(xml: &str, name: &'static str) -> Result<u32> {
+    field(xml, name)
+        .ok_or(Error::MissingField(name))?
+        .trim()
+        .parse()
+        .map_err(|_| Error::MissingField(name))
+}
+
+/// Replaces the text of the first `name` element inside `xml`.
+pub fn replace_field(xml: &str, name: &str, value: &str) -> String {
+    let re = Regex::new(&format!(
+        r"(<(?:[\w-]+:)?{}(?:\s[^>]*)?>)[^<]*(</)",
+        regex::escape(name)
+    ))
+    .expect("replace regex");
+    re.replace(xml, |c: &regex::Captures| {
+        format!("{}{}{}", &c[1], escape(value), &c[2])
+    })
+    .into_owned()
+}
+
+fn fault_reason(xml: &str) -> Option<String> {
+    if !xml.contains(":Fault>") && !xml.contains("<Fault>") {
+        return None;
+    }
+    let text = field(xml, "Text").unwrap_or_default();
+    let sub = field(xml, "Value").unwrap_or_default();
+    Some(format!("{text} {sub}").trim().to_string())
+}
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REDIR: &str = r#"<a:Body><g:AMT_RedirectionService><g:CreationClassName>AMT_RedirectionService</g:CreationClassName><g:EnabledState>32771</g:EnabledState><g:ListenerEnabled>false</g:ListenerEnabled></g:AMT_RedirectionService></a:Body>"#;
+
+    #[test]
+    fn reads_fields_with_any_prefix() {
+        assert_eq!(field(REDIR, "EnabledState").as_deref(), Some("32771"));
+        assert_eq!(field(REDIR, "ListenerEnabled").as_deref(), Some("false"));
+        assert_eq!(field_u32(REDIR, "EnabledState").unwrap(), 32771);
+        assert!(field(REDIR, "Nope").is_none());
+    }
+
+    #[test]
+    fn does_not_match_prefix_of_longer_name() {
+        let xml = "<g:EnabledStateX>1</g:EnabledStateX><g:EnabledState>2</g:EnabledState>";
+        assert_eq!(field(xml, "EnabledState").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn extracts_and_edits_instance() {
+        let inst = element(REDIR, "AMT_RedirectionService").unwrap();
+        assert!(inst.starts_with("<g:AMT_RedirectionService>"));
+        assert!(inst.ends_with("</g:AMT_RedirectionService>"));
+        let edited = replace_field(&inst, "ListenerEnabled", "true");
+        assert_eq!(field(&edited, "ListenerEnabled").as_deref(), Some("true"));
+        assert_eq!(field(&edited, "EnabledState").as_deref(), Some("32771"));
+    }
+
+    #[test]
+    fn detects_fault() {
+        let xml = r#"<a:Body><a:Fault><a:Code><a:Value>a:Sender</a:Value></a:Code><a:Reason><a:Text xml:lang="en-US">The specified resource is not supported.</a:Text></a:Reason></a:Fault></a:Body>"#;
+        assert_eq!(
+            fault_reason(xml).as_deref(),
+            Some("The specified resource is not supported. a:Sender")
+        );
+        assert!(fault_reason(REDIR).is_none());
+    }
+
+    #[test]
+    fn envelope_carries_action_and_resource() {
+        let e = envelope(ACTION_GET, "urn:x", "", "");
+        assert!(
+            e.contains("<a:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/Get</a:Action>")
+        );
+        assert!(e.contains("<w:ResourceURI>urn:x</w:ResourceURI>"));
+    }
+}

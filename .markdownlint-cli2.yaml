@@ -1,0 +1,7 @@
+# Prose wraps at 100 columns, like the code. Tables and code blocks are exempt:
+# breaking a table row or a command line to satisfy a linter makes it wrong.
+config:
+  MD013:
+    line_length: 100
+    tables: false
+    code_blocks: false

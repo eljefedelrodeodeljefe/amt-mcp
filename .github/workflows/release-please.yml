@@ -1,0 +1,43 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Cancel superseded runs — release-please is idempotent so dropping a queued
+# run is always safe.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: ${{ github.ref_name }}
+
+  # The release above is created with GITHUB_TOKEN, whose events start no
+  # workflows, so release.yml's `release: published` trigger never fires for it.
+  # Build and attach the assets from here instead.
+  release-assets:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}

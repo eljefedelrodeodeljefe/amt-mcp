@@ -1,0 +1,13 @@
+[package]
+name = "amt-fake"
+description = "Test-only scripted fake of the Intel AMT redirection service (Serial-over-LAN)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }
+md-5 = "0.10"
+hex = "0.4"

@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  # A release published by a person. Releases created by release-please do NOT fire
+  # this: events from GITHUB_TOKEN start no workflows. release-please.yml calls this
+  # workflow directly instead.
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build and attach assets to"
+        type: string
+        required: true
+  # Backfill assets for an existing release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach assets to"
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+# Never cancel — interrupting mid-upload leaves a half-published release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build / ${{ matrix.target }}
+    # Skip pre-releases (tags with a `-` suffix, e.g. 0.2.0-rc.1).
+    if: "!github.event.release.prerelease"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          staging="amt-mcp-${{ inputs.tag || github.event.release.tag_name }}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp target/${{ matrix.target }}/release/amt-mcp LICENSE README.md "$staging/"
+          tar -czf "dist/$staging.tar.gz" "$staging"
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ inputs.tag || github.event.release.tag_name }}" dist/*.tar.gz --clobber
+
+  # SBOM for the released version, attached to the release as a durable asset.
+  # Informational: a finding must never block a release that has already been published —
+  # the weekly gating scan in sbom-scan.yml is where enforcement lives.
+  sbom:
+    name: SBOM + vulnerability scan
+    if: "!github.event.release.prerelease"
+    uses: ./.github/workflows/sbom-scan.yml
+    permissions:
+      contents: write
+    with:
+      mode: informational
+      upload-to-release: ${{ inputs.tag || github.event.release.tag_name }}

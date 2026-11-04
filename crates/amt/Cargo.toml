@@ -1,0 +1,25 @@
+[package]
+name = "amt"
+description = "Intel AMT client: WS-Man over HTTP digest, power control, user consent and Serial-over-LAN redirection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+schemars = ["dep:schemars"]
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+md-5 = "0.10"
+hex = "0.4"
+rand = "0.9"
+regex = "1"
+schemars = { version = "1.0", optional = true }
+
+[dev-dependencies]
+amt-fake = { workspace = true }
