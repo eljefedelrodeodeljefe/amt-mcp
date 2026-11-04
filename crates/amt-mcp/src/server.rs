@@ -34,6 +34,8 @@ pub struct AmtServer {
     /// At most one SOL session per process; AMT allows one per device anyway.
     sol: Mutex<Option<SolSession>>,
     kvm: Mutex<Option<KvmSession>>,
+    /// KVM over the redirection port (default) or the VNC port 5900.
+    kvm_over_vnc: bool,
     /// The RFB password set by kvm_enable, or read from AMT_RFB_PASSWORD_FILE.
     rfb_password: Mutex<Option<String>>,
     ider: Mutex<Option<IderSession>>,
@@ -94,6 +96,13 @@ impl AmtServer {
             writes_enabled,
             sol: Mutex::new(None),
             kvm: Mutex::new(None),
+            kvm_over_vnc: match std::env::var("AMT_KVM_TRANSPORT").as_deref() {
+                Ok("vnc") => true,
+                Ok("redirection") | Err(_) => false,
+                Ok(other) => {
+                    anyhow::bail!("AMT_KVM_TRANSPORT must be redirection or vnc, not {other}")
+                }
+            },
             rfb_password: Mutex::new(match std::env::var("AMT_RFB_PASSWORD_FILE") {
                 Ok(path) => Some(read_secret(&path, "AMT_RFB_PASSWORD_FILE")?),
                 Err(_) => None,
@@ -125,23 +134,26 @@ impl AmtServer {
         }
     }
 
-    /// The KVM session, opened on first use with the known RFB password.
+    /// The KVM session, opened on first use over the configured transport.
     async fn kvm_session(
         &self,
     ) -> Result<tokio::sync::MutexGuard<'_, Option<KvmSession>>, ErrorData> {
         let mut slot = self.kvm.lock().await;
         if slot.is_none() {
-            let pw = self.rfb_password.lock().await.clone().ok_or_else(|| {
-                ErrorData::new(
-                    ErrorCode::INVALID_REQUEST,
-                    "no RFB password known — call kvm_enable or set AMT_RFB_PASSWORD_FILE",
-                    None,
-                )
-            })?;
-            let host = self.device.client().endpoint().host.clone();
-            let session = KvmSession::open(&host, amt::kvm::VNC_PORT, &pw, self.timeout)
-                .await
-                .map_err(|e| tool_error(e.into()))?;
+            let ep = self.device.client().endpoint();
+            let session = if self.kvm_over_vnc {
+                let pw = self.rfb_password.lock().await.clone().ok_or_else(|| {
+                    ErrorData::new(
+                        ErrorCode::INVALID_REQUEST,
+                        "no RFB password known — call kvm_enable with rfb_password_file or set AMT_RFB_PASSWORD_FILE",
+                        None,
+                    )
+                })?;
+                KvmSession::open(&ep.host, amt::kvm::VNC_PORT, &pw, self.timeout).await
+            } else {
+                KvmSession::open_redirection(ep, self.sol_port, self.timeout).await
+            }
+            .map_err(|e| tool_error(e.into()))?;
             *slot = Some(session);
         }
         Ok(slot)
@@ -493,20 +505,30 @@ impl AmtServer {
     // ── KVM ───────────────────────────────────────────────────────────────────
 
     #[tool(
-        description = "Enable KVM on the standard VNC port: set the RFB password (IPS_KVMRedirectionSettingData Is5900PortEnabled/RFBPassword) and enable the KVM service (CIM_KVMRedirectionSAP.RequestStateChange 2). The password is read from a file"
+        description = "Enable the KVM service (CIM_KVMRedirectionSAP.RequestStateChange 2). With rfb_password_file it also opens the standard VNC port 5900 with that RFB password (IPS_KVMRedirectionSettingData Is5900PortEnabled/RFBPassword), needed only for AMT_KVM_TRANSPORT=vnc"
     )]
     async fn kvm_enable(
         &self,
         Parameters(p): Parameters<KvmEnableParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let pw = read_secret(&p.rfb_password_file, "rfb_password_file").map_err(tool_error)?;
-        let state = self
-            .device
-            .enable_kvm(&pw)
-            .await
-            .map_err(|e| tool_error(e.into()))?;
-        *self.rfb_password.lock().await = Some(pw);
+        let state = match &p.rfb_password_file {
+            Some(path) => {
+                let pw = read_secret(path, "rfb_password_file").map_err(tool_error)?;
+                let state = self
+                    .device
+                    .enable_kvm(&pw)
+                    .await
+                    .map_err(|e| tool_error(e.into()))?;
+                *self.rfb_password.lock().await = Some(pw);
+                state
+            }
+            None => self
+                .device
+                .enable_kvm_service()
+                .await
+                .map_err(|e| tool_error(e.into()))?,
+        };
         Ok(Self::ok(&serde_json::to_value(state).unwrap_or_default()))
     }
 
@@ -527,7 +549,7 @@ impl AmtServer {
     }
 
     #[tool(
-        description = "Screenshot of the device's display over KVM (RFB on 5900), returned as a PNG image: BIOS setup, boot loader, installer or desktop. Opens the KVM session on first use. In client control mode grant user consent first"
+        description = "Screenshot of the device's display over KVM, returned as a PNG image: BIOS setup, boot loader, installer or desktop. Uses KVM inside a redirection session on 16994 (default) or the VNC port (AMT_KVM_TRANSPORT=vnc). Opens the session on first use. In client control mode grant user consent first. AMT's KVM framebuffer is limited to about 9.2 MB (3840x2160 is too large)"
     )]
     async fn kvm_screenshot(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
@@ -703,7 +725,7 @@ const INSTRUCTIONS: &str = concat!(
     "redirection protocol (Serial-over-LAN, port 16994). Configure with AMT_HOST and ",
     "AMT_PASSWORD_FILE (or AMT_PASSWORD). Optional: AMT_USER (default admin), AMT_PORT, ",
     "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_READ_USER + AMT_READ_PASSWORD_FILE ",
-    "(a least-privilege account used for read tools), AMT_RFB_PASSWORD_FILE (KVM), AMT_ALLOW_WRITES (default false — must ",
+    "(a least-privilege account used for read tools), AMT_KVM_TRANSPORT (redirection or vnc), AMT_RFB_PASSWORD_FILE (KVM over vnc), AMT_ALLOW_WRITES (default false — must ",
     "be 'true' for power, consent and console tools). ",
     "Power actions are immediate and bypass the OS. In client control mode every SOL, ",
     "IDE-R or KVM session needs a 6-digit consent code that only someone at the device's ",

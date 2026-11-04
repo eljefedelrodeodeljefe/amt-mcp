@@ -31,7 +31,7 @@ pub const GUIDES: &[Guide] = &[
     Guide {
         name: "troubleshooting",
         title: "Troubleshooting",
-        description: "Known failure modes and fixes: rpc-go stalls, MEBx password errors, consent, KVM resolution limit, connection limits",
+        description: "Known failure modes and fixes: rpc-go stalls, MEBx password errors, consent, KVM framebuffer limit, connection limits",
         text: include_str!("../../../docs/guides/troubleshooting.md"),
     },
 ];

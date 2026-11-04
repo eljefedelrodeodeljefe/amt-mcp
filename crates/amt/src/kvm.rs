@@ -1,14 +1,19 @@
-//! KVM through AMT's standard VNC port (5900): enable it over WS-Man with an
-//! RFB password, then speak plain RFB to take screenshots and send keys. This
-//! sees what the display shows, including BIOS setup and boot loaders.
+//! KVM: enable it over WS-Man, then speak RFB to take screenshots and send
+//! keys. This sees what the display shows, including BIOS setup and boot
+//! loaders.
 //!
-//! Only the Raw encoding is requested, so a full-screen update is large but
-//! needs no decoder; frames are converted from 16-bit RGB565 to PNG.
+//! Updates arrive as ZRLE (AMT's "RLE") or Raw in AMT's native pixel format
+//! and are converted to PNG. AMT's KVM framebuffer is limited to about 9.2 MB
+//! (bytes per pixel x width x height): 3840x2160 at 16 bits is over it.
 //!
-//! Known limit: on AMT 12 with a 3840x2160 display, login and ServerInit
-//! succeed but AMT resets the connection on the first framebuffer request,
-//! even for a small region. AMT's KVM capture has a maximum resolution; use a
-//! lower display/console resolution (e.g. the `video=` kernel parameter).
+//! Two transports: inside an AMT redirection session (port 16994, session
+//! "KVMR", digest-authenticated, RFB security None) — the path Intel's own
+//! tools use — or the standard VNC port 5900 with an RFB password. Both work;
+//! the redirection path needs no RFB password and no open port 5900.
+//!
+//! AMT ends the session on the first update request unless the client offers
+//! ZRLE (with Raw) and asks for the whole screen in one request, as Intel's
+//! own client does.
 
 use std::time::Duration;
 
@@ -19,7 +24,10 @@ use tokio::net::TcpStream;
 
 use crate::device::{Device, declare_prefix};
 use crate::error::{Error, Result};
+use crate::redir::{self, expect_type, read_exact};
+use crate::wsman::Endpoint;
 use crate::wsman::{self, CIM, IPS, field_u32};
+use crate::zrle::{self, Zrle};
 
 pub const VNC_PORT: u16 = 5900;
 
@@ -58,6 +66,13 @@ impl Device {
         let inst = wsman::replace_field(&inst, "RFBPassword", rfb_password);
         let inst = declare_prefix(&inst, &uri);
         self.client().put(&uri, &inst).await?;
+        self.kvm_sap_state(2).await?;
+        self.kvm_state().await
+    }
+
+    /// Enables the KVM service only, leaving the VNC port as it is. Enough for
+    /// KVM over the redirection port (`KvmSession::open_redirection`).
+    pub async fn enable_kvm_service(&self) -> Result<KvmState> {
         self.kvm_sap_state(2).await?;
         self.kvm_state().await
     }
@@ -168,22 +183,56 @@ pub struct KvmSession {
     height: u16,
     format: PixelFormat,
     palette: Vec<[u8; 3]>,
+    zrle: Zrle,
     timeout: Duration,
 }
 
+/// How the RFB session authenticates.
+enum Security<'a> {
+    /// VNC authentication with the RFB password (port 5900).
+    Vnc(&'a str),
+    /// None: the redirection layer already authenticated the session.
+    None,
+}
+
 impl KvmSession {
-    /// Connects to 5900 and authenticates with the RFB password. In client
+    /// KVM inside an AMT redirection session (port 16994, session "KVMR"),
+    /// authenticated with the AMT account's digest credentials — the path
+    /// Intel's own tools use. Needs no RFB password and no port 5900. In client
     /// control mode, user consent must be granted first.
+    pub async fn open_redirection(ep: &Endpoint, port: u16, timeout: Duration) -> Result<Self> {
+        let (mut rd, mut w) = redir::open(ep, port, redir::KVMR, timeout).await?;
+        w.send(&[0x40, 0, 0, 0, 0, 0, 0, 0]).await?;
+        let reply = tokio::time::timeout(timeout, read_exact(&mut rd, 8))
+            .await
+            .map_err(|_| Error::Timeout("KVM redirection start"))??;
+        expect_type(&reply, 0x41)?;
+        let stream = rd
+            .reunite(w.half)
+            .map_err(|_| Error::Protocol("KVM socket halves did not match".into()))?;
+        Self::rfb(stream, Security::None, &ep.host, timeout).await
+    }
+
+    /// KVM on the standard VNC port, authenticated with the RFB password.
     pub async fn open(
         host: &str,
         port: u16,
         rfb_password: &str,
         timeout: Duration,
     ) -> Result<Self> {
-        let mut s = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
+        let s = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
             .await
             .map_err(|_| Error::Timeout("connecting to the KVM port"))??;
         s.set_nodelay(true)?;
+        Self::rfb(s, Security::Vnc(rfb_password), host, timeout).await
+    }
+
+    async fn rfb(
+        mut s: TcpStream,
+        security: Security<'_>,
+        host: &str,
+        timeout: Duration,
+    ) -> Result<Self> {
         tokio::time::timeout(timeout, async {
             let mut ver = [0u8; 12];
             s.read_exact(&mut ver).await?;
@@ -198,11 +247,14 @@ impl KvmSession {
                 _ => 8,
             };
             s.write_all(format!("RFB 003.{use_minor:03}\n").as_bytes()).await?;
-
+            let want: u8 = match security {
+                Security::Vnc(_) => 2,
+                Security::None => 1,
+            };
             if use_minor == 3 {
                 let t = s.read_u32().await?;
-                if t != 2 {
-                    return Err(Error::Protocol(format!("RFB security type {t}, expected VNC auth")));
+                if t != want as u32 {
+                    return Err(Error::Protocol(format!("RFB security type {t}, expected {want}")));
                 }
             } else {
                 let n = s.read_u8().await? as usize;
@@ -211,22 +263,27 @@ impl KvmSession {
                 }
                 let mut types = vec![0u8; n];
                 s.read_exact(&mut types).await?;
-                if !types.contains(&2) {
-                    return Err(Error::Protocol(format!("no VNC authentication offered: {types:?}")));
+                if !types.contains(&want) {
+                    return Err(Error::Protocol(format!(
+                        "RFB security type {want} not offered: {types:?}"
+                    )));
                 }
-                s.write_u8(2).await?;
+                s.write_u8(want).await?;
             }
-            let mut challenge = [0u8; 16];
-            s.read_exact(&mut challenge).await?;
-            s.write_all(&vnc_response(rfb_password, &challenge)).await?;
-            if s.read_u32().await? != 0 {
+            if let Security::Vnc(password) = security {
+                let mut challenge = [0u8; 16];
+                s.read_exact(&mut challenge).await?;
+                s.write_all(&vnc_response(password, &challenge)).await?;
+            }
+            // RFB 3.8 sends a SecurityResult for every type, None included.
+            if (use_minor >= 8 || want == 2) && s.read_u32().await? != 0 {
                 let reason = if use_minor >= 8 {
                     read_reason(&mut s).await
                 } else {
                     "authentication failed".into()
                 };
                 return Err(Error::Protocol(format!(
-                    "KVM login refused: {reason}. Check the RFB password and that user consent is granted"
+                    "KVM login refused: {reason}. Check the credentials and that user consent is granted"
                 )));
             }
             s.write_u8(1).await?; // ClientInit: shared
@@ -241,40 +298,28 @@ impl KvmSession {
             .map_err(|_| Error::Timeout("RFB ServerInit"))??;
         let width = u16::from_be_bytes([init[0], init[1]]);
         let height = u16::from_be_bytes([init[2], init[3]]);
-        let native = PixelFormat::parse(&init[4..20]);
+        // Keep AMT's native pixel format (16-bit RGB565 on AMT 12): AMT does
+        // not accept every SetPixelFormat a client might ask for.
+        let format = PixelFormat::parse(&init[4..20]);
         let name_len = u32::from_be_bytes([init[20], init[21], init[22], init[23]]) as usize;
         let mut name = vec![0u8; name_len.min(4096)];
         s.read_exact(&mut name).await?;
-        // SetPixelFormat: 16-bit RGB565 little-endian, the depth AMT's KVM
-        // serves reliably (MeshCommander uses the same).
-        let format = PixelFormat {
-            bpp: 16,
-            big_endian: false,
-            true_colour: true,
-            max: [31, 63, 31],
-            shift: [11, 5, 0],
-        };
-        let mut spf = vec![0u8, 0, 0, 0, 16, 16, 0, 1];
-        for m in format.max {
-            spf.extend_from_slice(&m.to_be_bytes());
+        // SetEncodings as Intel's own client sends them: ZRLE (AMT's "RLE"),
+        // Raw (AMT refuses a list without it) and DesktopSize (-223). AMT ends
+        // the session on the first update request if ZRLE is not offered.
+        let mut enc = vec![2u8, 0, 0, 3];
+        for e in [16i32, 0, -223] {
+            enc.extend_from_slice(&e.to_be_bytes());
         }
-        spf.extend_from_slice(&[11, 5, 0, 0, 0, 0]);
-        s.write_all(&spf).await?;
-        // SetEncodings: Raw only.
-        s.write_all(&[2, 0, 0, 1, 0, 0, 0, 0]).await?;
-        tracing::info!(
-            host,
-            width,
-            height,
-            native_bpp = native.bpp,
-            "KVM session open"
-        );
+        s.write_all(&enc).await?;
+        tracing::info!(host, width, height, bpp = format.bpp, "KVM session open");
         Ok(Self {
             stream: s,
             width,
             height,
             format,
             palette: vec![[0, 0, 0]; 256],
+            zrle: Zrle::new(),
             timeout,
         })
     }
@@ -283,30 +328,17 @@ impl KvmSession {
         (self.width, self.height)
     }
 
-    /// A full-screen framebuffer, PNG-encoded. Requested in horizontal bands
-    /// so no single update is larger than a few megabytes.
+    /// A full-screen framebuffer, PNG-encoded.
     pub async fn screenshot(&mut self) -> Result<Vec<u8>> {
-        let (w, h) = (self.width as usize, self.height as usize);
-        let mut rgb = vec![0u8; w * h * 3];
-        let band = (2_000_000 / (w.max(1) * 2)).clamp(16, h.max(16)) as u16;
-        let mut y = 0u16;
-        while y < self.height {
-            let bh = band.min(self.height - y);
-            self.request(y, bh).await?;
-            let timeout = self.timeout;
-            match tokio::time::timeout(timeout * 2, self.read_update(&mut rgb, w, h)).await {
-                Err(_) => return Err(Error::Timeout("KVM framebuffer")),
-                Ok(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                    let (w, h) = (self.width, self.height);
-                    return Err(Error::Protocol(format!(
-                        "AMT reset the KVM connection on a framebuffer request ({w}x{h}). {}",
-                        "AMT's KVM capture has a resolution limit; try a lower display resolution"
-                    )));
-                }
-                Ok(r) => r?,
-            }
-            y += bh;
-        }
+        // A DesktopSize rectangle mid-capture means the mode changed: start over
+        // once at the new size.
+        let (rgb, w, h) = match self.capture().await? {
+            Some(frame) => frame,
+            None => self
+                .capture()
+                .await?
+                .ok_or_else(|| Error::Protocol("display size keeps changing".into()))?,
+        };
         let mut png_bytes = Vec::new();
         {
             let mut enc = png::Encoder::new(&mut png_bytes, w as u32, h as u32);
@@ -322,6 +354,30 @@ impl KvmSession {
         Ok(png_bytes)
     }
 
+    /// Reads the whole screen with one full, non-incremental request, as
+    /// Intel's client does (AMT ends the session on partial-region requests).
+    /// `None` if the size changed meanwhile.
+    async fn capture(&mut self) -> Result<Option<(Vec<u8>, usize, usize)>> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        self.request(0, self.height).await?;
+        let timeout = self.timeout;
+        let resized =
+            match tokio::time::timeout(timeout * 3, self.read_update(&mut rgb, w, h)).await {
+                Err(_) => return Err(Error::Timeout("KVM framebuffer")),
+                Ok(Err(Error::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    return Err(Error::Protocol(
+                        "AMT reset the KVM connection on a framebuffer request".into(),
+                    ));
+                }
+                Ok(r) => r?,
+            };
+        if resized {
+            return Ok(None);
+        }
+        Ok(Some((rgb, w, h)))
+    }
+
     async fn request(&mut self, y: u16, height: u16) -> Result<()> {
         let mut req = vec![3u8, 0, 0, 0];
         req.extend_from_slice(&y.to_be_bytes());
@@ -332,17 +388,18 @@ impl KvmSession {
     }
 
     /// Reads server messages until one FramebufferUpdate has been applied.
-    async fn read_update(&mut self, rgb: &mut [u8], w: usize, h: usize) -> Result<()> {
+    async fn read_update(&mut self, rgb: &mut [u8], w: usize, h: usize) -> Result<bool> {
         loop {
             match self.stream.read_u8().await? {
                 0 => {
                     let mut hdr = [0u8; 3];
                     self.stream.read_exact(&mut hdr).await?;
                     let rects = u16::from_be_bytes([hdr[1], hdr[2]]);
+                    let mut resized = false;
                     for _ in 0..rects {
-                        self.read_rect(rgb, w, h).await?;
+                        resized |= self.read_rect(rgb, w, h).await?;
                     }
-                    return Ok(());
+                    return Ok(resized);
                 }
                 1 => self.read_colour_map().await?,
                 2 => {}
@@ -358,7 +415,8 @@ impl KvmSession {
         }
     }
 
-    async fn read_rect(&mut self, rgb: &mut [u8], w: usize, h: usize) -> Result<()> {
+    /// Applies one rectangle; true if it was a DesktopSize change.
+    async fn read_rect(&mut self, rgb: &mut [u8], w: usize, h: usize) -> Result<bool> {
         let mut r = [0u8; 12];
         self.stream.read_exact(&mut r).await?;
         let (x, y) = (
@@ -370,6 +428,29 @@ impl KvmSession {
             u16::from_be_bytes([r[6], r[7]]) as usize,
         );
         let enc = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
+        if enc == -223 {
+            self.width = rw as u16;
+            self.height = rh as u16;
+            return Ok(true);
+        }
+        if enc == 16 {
+            let len = self.stream.read_u32().await? as usize;
+            if len > 64 << 20 {
+                return Err(Error::Protocol(format!("ZRLE rectangle of {len} bytes")));
+            }
+            let mut packed = vec![0u8; len];
+            self.stream.read_exact(&mut packed).await?;
+            let tiles = self.zrle.inflate(&packed)?;
+            let (format, palette) = (self.format, &self.palette);
+            zrle::decode_tiles(&tiles, rw, rh, |cx, cy, v| {
+                let (px, py) = (x + cx, y + cy);
+                if px < w && py < h {
+                    let o = (py * w + px) * 3;
+                    rgb[o..o + 3].copy_from_slice(&format.rgb(&v.to_le_bytes(), palette));
+                }
+            })?;
+            return Ok(false);
+        }
         if enc != 0 {
             return Err(Error::Protocol(format!("unrequested RFB encoding {enc}")));
         }
@@ -388,7 +469,7 @@ impl KvmSession {
                 rgb[o..o + 3].copy_from_slice(&c);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn read_colour_map(&mut self) -> Result<()> {

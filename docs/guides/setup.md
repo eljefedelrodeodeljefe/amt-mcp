@@ -46,8 +46,11 @@ whose characters are in the same place on the local layout.
 - SOL and IDE-R: `rpc configure amtfeatures -sol -ider -kvm -password …` (may stall
   like activation; it often enables the features before stalling).
 - Open the redirection listener: `enable_sol_listener`.
-- KVM: `kvm_enable` with an RFB password file (exactly 8 characters, upper, lower,
-  digit, symbol).
+- KVM: `kvm_enable`. That is all the default transport (KVM inside a redirection
+  session on 16994) needs. Only for `AMT_KVM_TRANSPORT=vnc` pass an RFB password file
+  (exactly 8 characters, upper, lower, digit, symbol), which also opens port 5900.
+- Keep the display at or below AMT's KVM framebuffer limit (~9.2 MB: 1920x1080 at 16
+  bits is fine, 3840x2160 is not), e.g. with `video=1920x1080` on the kernel command line.
 - Check with `get_status` and `get_boot_options`.
 
 ## 5. Host side for a serial console

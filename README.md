@@ -27,7 +27,7 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 | | `sol_open` / `sol_close` | ✓ / | Serial-over-LAN session |
 | | `sol_read` | | Console output since the last read (ANSI stripped by default) |
 | | `sol_send` | ✓ | Types on the console; `escapes=true` for control keys |
-| KVM | `kvm_enable` / `kvm_disable` | ✓ | VNC port 5900 with an RFB password, KVM service on/off |
+| KVM | `kvm_enable` / `kvm_disable` | ✓ | KVM service on/off; optionally VNC port 5900 with an RFB password |
 | | `kvm_screenshot` | ✓ | The display as a PNG image |
 | | `kvm_send_keys` | ✓ | Text and named keys (`{f2}`, `{enter}`, …) |
 | | `kvm_close` | | Ends the KVM session |
@@ -51,7 +51,8 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 | `AMT_SOL_PORT` | `16994` | Redirection protocol |
 | `AMT_TIMEOUT_MS` | `15000` | |
 | `AMT_READ_USER` + `AMT_READ_PASSWORD_FILE` | — | A least-privilege account for read tools |
-| `AMT_RFB_PASSWORD_FILE` | — | RFB (VNC) password for KVM, if `kvm_enable` was done earlier |
+| `AMT_KVM_TRANSPORT` | `redirection` | KVM inside a redirection session on 16994, or `vnc` for port 5900 |
+| `AMT_RFB_PASSWORD_FILE` | — | RFB password, only for `AMT_KVM_TRANSPORT=vnc` |
 | `AMT_ALLOW_WRITES` | `false` | Must be `true` for anything that changes state |
 
 ```json
@@ -98,8 +99,8 @@ Power actions, reads and clearing a boot override need no consent.
 
 ## Known limits
 
-- KVM: with a 3840x2160 display, AMT 12 accepts the session but resets on the first
-  framebuffer request. Lower the display or console resolution.
+- KVM: AMT's KVM framebuffer is limited to about 9.2 MB (bytes per pixel x width x
+  height). At 16 bits per pixel, 3840x2160 is over it; 1920x1080 works.
 - `add_alarm`: start times must be before 2038 (AMT's clock is 32-bit).
 
 ## Security

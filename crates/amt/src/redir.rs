@@ -20,8 +20,26 @@ use crate::wsman::Endpoint;
 pub const DEFAULT_PORT: u16 = 16994;
 const AUTH_URI: &str = "/RedirectionService";
 
-pub const SOL: [u8; 4] = *b"SOL ";
-pub const IDER: [u8; 4] = *b"IDER";
+/// A redirection session kind: the start frame's flag byte and 4-byte name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Kind {
+    flags: u8,
+    name: [u8; 4],
+}
+
+pub(crate) const SOL: Kind = Kind {
+    flags: 0,
+    name: *b"SOL ",
+};
+pub(crate) const IDER: Kind = Kind {
+    flags: 0,
+    name: *b"IDER",
+};
+/// KVM over the redirection port; the start frame carries flag 0x01.
+pub(crate) const KVMR: Kind = Kind {
+    flags: 1,
+    name: *b"KVMR",
+};
 
 mod msg {
     pub const START_SESSION: u8 = 0x10;
@@ -60,7 +78,7 @@ impl Writer {
 pub(crate) async fn open(
     ep: &Endpoint,
     port: u16,
-    kind: [u8; 4],
+    kind: Kind,
     timeout: Duration,
 ) -> Result<(OwnedReadHalf, Writer)> {
     let stream = tokio::time::timeout(timeout, TcpStream::connect((ep.host.as_str(), port)))
@@ -79,11 +97,11 @@ async fn start_and_authenticate(
     rd: &mut OwnedReadHalf,
     w: &mut Writer,
     ep: &Endpoint,
-    kind: [u8; 4],
+    kind: Kind,
 ) -> Result<()> {
     // 1. StartRedirectionSession(kind).
-    let mut start = vec![msg::START_SESSION, 0, 0, 0];
-    start.extend_from_slice(&kind);
+    let mut start = vec![msg::START_SESSION, kind.flags, 0, 0];
+    start.extend_from_slice(&kind.name);
     w.send(&start).await?;
     let head = read_exact(rd, 13).await?;
     expect_type(&head, msg::START_SESSION_REPLY)?;

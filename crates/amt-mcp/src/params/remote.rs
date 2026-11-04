@@ -4,9 +4,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct KvmEnableParams {
     #[schemars(
-        description = "Path to a file on the MCP server's machine holding the RFB (VNC) password: exactly 8 characters with upper, lower, digit and a symbol. Never passed through the conversation"
+        description = "Only for the VNC transport (port 5900): path to a file on the MCP server's machine holding the RFB password, exactly 8 characters with upper, lower, digit and a symbol. Omit to enable just the KVM service, which is all the default redirection transport needs"
     )]
-    pub rfb_password_file: String,
+    pub rfb_password_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
