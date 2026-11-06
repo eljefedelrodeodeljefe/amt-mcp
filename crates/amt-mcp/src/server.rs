@@ -17,6 +17,7 @@ use rmcp::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::config;
 use crate::error::tool_error;
 use crate::guides;
 use crate::params::*;
@@ -62,9 +63,7 @@ impl AmtServer {
             .context("AMT_TIMEOUT_MS must be a whole number of milliseconds")?;
         let port = env_port("AMT_PORT", amt::wsman::DEFAULT_PORT)?;
         let sol_port = env_port("AMT_SOL_PORT", amt::sol::DEFAULT_PORT)?;
-        let writes_enabled = std::env::var("AMT_ALLOW_WRITES")
-            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
+        let writes_enabled = config::bool_env("AMT_ALLOW_WRITES", false)?;
 
         let mut ep = Endpoint::new(host.clone(), user, password);
         ep.port = port;
@@ -726,7 +725,8 @@ const INSTRUCTIONS: &str = concat!(
     "AMT_PASSWORD_FILE (or AMT_PASSWORD). Optional: AMT_USER (default admin), AMT_PORT, ",
     "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_READ_USER + AMT_READ_PASSWORD_FILE ",
     "(a least-privilege account used for read tools), AMT_KVM_TRANSPORT (redirection or vnc), AMT_RFB_PASSWORD_FILE (KVM over vnc), AMT_ALLOW_WRITES (default false — must ",
-    "be 'true' for power, consent and console tools). ",
+    "be 'true' for power, consent and console tools; true/false, 1/0 or yes/no, anything else ",
+    "stops the server). ",
     "Power actions are immediate and bypass the OS. In client control mode every SOL, ",
     "IDE-R or KVM session needs a 6-digit consent code that only someone at the device's ",
     "display can read: call consent_request, ask the user for the code, then ",

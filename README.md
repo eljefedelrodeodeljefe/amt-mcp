@@ -56,6 +56,9 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 | `AMT_RFB_PASSWORD_FILE` | — | RFB password, only for `AMT_KVM_TRANSPORT=vnc` |
 | `AMT_ALLOW_WRITES` | `false` | Must be `true` for anything that changes state |
 
+Boolean variables take `true`/`false`, `1`/`0` or `yes`/`no` in any case. Anything else
+(`on`, an empty value) stops the server at startup with an error naming the variable.
+
 ```json
 {
   "mcpServers": {
