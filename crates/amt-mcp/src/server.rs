@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use crate::config;
 use crate::error::tool_error;
 use crate::guides;
+use crate::logging;
 use crate::params::*;
 use crate::tools;
 
@@ -272,9 +273,9 @@ impl AmtServer {
     )]
     async fn sync_clock(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::sync_clock(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::sync_clock(&self.device).await;
+        logging::write_tool("sync_clock", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -286,9 +287,13 @@ impl AmtServer {
         Parameters(p): Parameters<AddAlarmParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::add_alarm(&self.device, &p)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::add_alarm(&self.device, &p).await;
+        logging::write_tool(
+            "add_alarm",
+            &format!("name={} start={}", p.name, p.start),
+            &res,
+        );
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -298,9 +303,9 @@ impl AmtServer {
         Parameters(p): Parameters<AlarmNameParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::delete_alarm(&self.device, &p.name)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::delete_alarm(&self.device, &p.name).await;
+        logging::write_tool("delete_alarm", &format!("name={}", p.name), &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -312,9 +317,13 @@ impl AmtServer {
         Parameters(p): Parameters<AddAccountParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::add_account(&self.device, &p)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::add_account(&self.device, &p).await;
+        logging::write_tool(
+            "add_account",
+            &format!("user={} realms={:?}", p.user, p.realms),
+            &res,
+        );
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -326,9 +335,9 @@ impl AmtServer {
         Parameters(p): Parameters<AccountHandleParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::remove_account(&self.device, p.handle)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::remove_account(&self.device, p.handle).await;
+        logging::write_tool("remove_account", &format!("handle={}", p.handle), &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -342,9 +351,13 @@ impl AmtServer {
         Parameters(p): Parameters<NextBootParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::set_next_boot(&self.device, &p)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::set_next_boot(&self.device, &p).await;
+        logging::write_tool(
+            "set_next_boot",
+            &format!("target={:?} sol={:?}", p.target, p.sol),
+            &res,
+        );
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -384,9 +397,9 @@ impl AmtServer {
         Parameters(p): Parameters<PowerParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::power(&self.device, p.action)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::power(&self.device, p.action).await;
+        logging::write_tool("power", &format!("action={:?}", p.action), &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -397,9 +410,9 @@ impl AmtServer {
     )]
     async fn consent_request(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::consent_request(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::consent_request(&self.device).await;
+        logging::write_tool("consent_request", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -411,9 +424,9 @@ impl AmtServer {
         Parameters(p): Parameters<ConsentCodeParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::consent_submit(&self.device, &p.code)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::consent_submit(&self.device, &p.code).await;
+        logging::write_tool("consent_submit", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -422,9 +435,9 @@ impl AmtServer {
     )]
     async fn consent_cancel(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::consent_cancel(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::consent_cancel(&self.device).await;
+        logging::write_tool("consent_cancel", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -435,9 +448,9 @@ impl AmtServer {
     )]
     async fn enable_sol_listener(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::enable_sol_listener(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::enable_sol_listener(&self.device).await;
+        logging::write_tool("enable_sol_listener", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -454,10 +467,10 @@ impl AmtServer {
                 &serde_json::json!({ "open": true, "reused": true }),
             ));
         }
-        let session =
-            SolSession::open(self.device.client().endpoint(), self.sol_port, self.timeout)
-                .await
-                .map_err(|e| tool_error(e.into()))?;
+        let res =
+            SolSession::open(self.device.client().endpoint(), self.sol_port, self.timeout).await;
+        logging::write_tool("sol_open", "", &res);
+        let session = res.map_err(|e| tool_error(e.into()))?;
         *slot = Some(session);
         Ok(Self::ok(
             &serde_json::json!({ "open": true, "reused": false }),
@@ -514,19 +527,17 @@ impl AmtServer {
         let state = match &p.rfb_password_file {
             Some(path) => {
                 let pw = read_secret(path, "rfb_password_file").map_err(tool_error)?;
-                let state = self
-                    .device
-                    .enable_kvm(&pw)
-                    .await
-                    .map_err(|e| tool_error(e.into()))?;
+                let res = self.device.enable_kvm(&pw).await;
+                logging::write_tool("kvm_enable", "port_5900=true", &res);
+                let state = res.map_err(|e| tool_error(e.into()))?;
                 *self.rfb_password.lock().await = Some(pw);
                 state
             }
-            None => self
-                .device
-                .enable_kvm_service()
-                .await
-                .map_err(|e| tool_error(e.into()))?,
+            None => {
+                let res = self.device.enable_kvm_service().await;
+                logging::write_tool("kvm_enable", "port_5900=unchanged", &res);
+                res.map_err(|e| tool_error(e.into()))?
+            }
         };
         Ok(Self::ok(&serde_json::to_value(state).unwrap_or_default()))
     }
@@ -539,11 +550,9 @@ impl AmtServer {
         if let Some(k) = self.kvm.lock().await.take() {
             k.close().await;
         }
-        let state = self
-            .device
-            .disable_kvm()
-            .await
-            .map_err(|e| tool_error(e.into()))?;
+        let res = self.device.disable_kvm().await;
+        logging::write_tool("kvm_disable", "", &res);
+        let state = res.map_err(|e| tool_error(e.into()))?;
         Ok(Self::ok(&serde_json::to_value(state).unwrap_or_default()))
     }
 
@@ -622,15 +631,21 @@ impl AmtServer {
                 None,
             ));
         }
-        let session = IderSession::open(
+        let start = p.start.unwrap_or(amt::IderStart::OnReboot);
+        let res = IderSession::open(
             self.device.client().endpoint(),
             self.sol_port,
             std::path::Path::new(&p.iso_path),
-            p.start.unwrap_or(amt::IderStart::OnReboot),
+            start,
             self.timeout,
         )
-        .await
-        .map_err(|e| tool_error(e.into()))?;
+        .await;
+        logging::write_tool(
+            "ider_start",
+            &format!("iso={} start={start:?}", p.iso_path),
+            &res,
+        );
+        let session = res.map_err(|e| tool_error(e.into()))?;
         let status = session.status().await;
         *slot = Some(session);
         Ok(Self::ok(&serde_json::to_value(status).unwrap_or_default()))

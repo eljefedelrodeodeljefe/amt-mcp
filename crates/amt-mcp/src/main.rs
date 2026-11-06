@@ -1,10 +1,10 @@
 use anyhow::Result;
 use rmcp::{ServiceExt, transport::stdio};
-use tracing_subscriber::EnvFilter;
 
 mod config;
 mod error;
 mod guides;
+mod logging;
 mod params;
 mod server;
 mod tools;
@@ -13,7 +13,7 @@ mod tools;
 async fn main() -> Result<()> {
     // Log to stderr — stdout is reserved for MCP JSON-RPC messages.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(logging::filter(std::env::var("RUST_LOG").ok().as_deref()))
         .with_writer(std::io::stderr)
         .init();
 
