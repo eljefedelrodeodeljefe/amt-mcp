@@ -4,10 +4,10 @@
 | --- | --- | --- |
 | `rpc activate`/`configure` hangs, `Execution timeout after 20s` | No LMS on Linux; the ME's local transport stalls | **Human:** full AC drain (unplug ≥ 30 s), retry. Kill a hung `rpc` with `pkill -x rpc` (not `-f`, which can match the shell running it) |
 | MEBx "Error applying new password" | Password rules or a stuck ME | Include a symbol; avoid `"` `,` `:`; MEBx uses the US layout. **Human:** AC drain, retry |
-| `amtterm`: "session authentication failed" | It only knows plain-password auth; AMT 12+ wants digest | Use `sol_open` here |
+| `amtterm`: "session authentication failed" | `amtterm` supports only plain-password auth; AMT 12+ requires digest | Use `sol_open` here |
 | `set_next_boot` refused, "not authorized" | Client control mode: forced boot sources need consent | Consent first; clearing with `default` works without |
 | `add_alarm`: "XML content is not valid" | Start time after 2037 (AMT's clock is 32-bit) | Use an earlier date |
-| Tool calls fail intermittently in parallel | AMT's web server handles very few connections | This server serializes requests per device; for other clients, do the same |
+| Tool calls fail intermittently in parallel | AMT's web server handles only a few concurrent connections | This server serializes requests per device; for other clients, do the same |
 | `kvm_screenshot`: AMT resets the connection | The framebuffer is over AMT's ~9.2 MB KVM limit (3840x2160 at 16 bits is), or a client offered no RLE/ZRLE or asked for a partial region | Lower the display or console resolution (e.g. `video=1920x1080` on the kernel command line). This server already offers ZRLE and requests the whole screen |
 | `sol_open`: StartRedirectionSession refused | Listener closed or SOL disabled | `enable_sol_listener`; `get_status` → `redirection` |
 | Nothing answers on 16992 | AMT not provisioned, network access not activated, or filtered | `rpc amtinfo` on the host; check `get_network` from a reachable host |

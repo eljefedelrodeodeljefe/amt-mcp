@@ -1,7 +1,7 @@
 # Recipes
 
-Steps marked **Human** need someone at the device. "Consent" means: in client
-control mode with consent policy `all`, run `consent_request`, ask the person at the
+Steps marked **Human** need someone at the device. A "Consent" step is the consent flow
+in client control mode with consent policy `all`: run `consent_request`, ask the person at the
 device for the 6-digit code shown on its display, then `consent_submit`. The code
 expires after about two minutes.
 
@@ -58,8 +58,8 @@ takes effect at the next boot.
    `kvm_screenshot`. `ider_status` shows blocks served.
 6. `ider_stop` once the installer no longer needs the CD.
 
-To check IDE-R without rebooting: `ider_start` with `start=now`; the running host sees
-a new "Intel Virtual CD".
+To check IDE-R without rebooting, run `ider_start` with `start=now`; the running host
+sees a new "Intel Virtual CD".
 
 ## Scheduled wake
 

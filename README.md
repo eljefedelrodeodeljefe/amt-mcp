@@ -1,8 +1,9 @@
 # amt-mcp
 
 An [MCP](https://modelcontextprotocol.io) server for **Intel AMT** (vPro) out-of-band
-management: power control, user consent, and a Serial-over-LAN console, over AMT's own
-protocols. No MPS, MeshCentral or agent on the target is needed.
+management over AMT's own protocols: power control, user consent, Serial-over-LAN, KVM,
+IDE-R remote disk, boot overrides, logs, scheduled wake and accounts. No MPS, MeshCentral
+or agent on the target is needed.
 
 Version 0.2.0 <!-- x-release-please-version -->
 
@@ -13,7 +14,7 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 | Area | Tool | Writes | What it does |
 | --- | --- | :---: | --- |
 | Status | `get_status` | | Power state, control mode, consent, SOL/IDE-R/listener and KVM settings |
-| | `get_inventory` | | BIOS, chassis model/serial, CPUs, memory, AMT version — with the OS down |
+| | `get_inventory` | | BIOS, chassis model/serial, CPUs, memory, AMT version (also with the OS down) |
 | | `get_network` | | AMT's host name, digest realm, per-port MAC, link, DHCP, address |
 | | `get_event_log` | | Platform events: BIOS/POST progress, firmware errors, boot failures |
 | | `get_audit_log` | | Who used AMT: power actions, SOL/IDE-R/KVM sessions, consent, accounts |
@@ -80,12 +81,12 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 
 ## Guides
 
-The server carries operator guides — [setup](docs/guides/setup.md) (including the steps
-that need a person at the device), [security](docs/guides/security.md),
-[recipes](docs/guides/recipes.md) and [troubleshooting](docs/guides/troubleshooting.md) —
-as MCP resources (`amt://guide/<name>`) and through `list_guides`/`get_guide`.
+The server carries operator guides as MCP resources (`amt://guide/<name>`) and through
+`list_guides`/`get_guide`: [setup](docs/guides/setup.md) (including the steps that need a
+person at the device), [security](docs/guides/security.md), [recipes](docs/guides/recipes.md)
+and [troubleshooting](docs/guides/troubleshooting.md).
 
-## User consent
+## User consent needs a person at the device
 
 In client control mode AMT requires consent for every SOL, IDE-R and KVM session and
 for forced boot sources, and the policy cannot be changed. The code appears **only on

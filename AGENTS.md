@@ -1,6 +1,6 @@
-# AGENTS.md — conventions for `amt-mcp`
+# AGENTS.md: conventions for `amt-mcp`
 
-Ported from `rigol-mcp` so muscle memory transfers between the two.
+Ported from `rigol-mcp`, so the two repos follow the same conventions.
 
 ## Branching and commits
 
@@ -42,8 +42,8 @@ crates/amt-fake/       test-only fake of the redirection service, SOL and IDE-R 
 docs/guides/           operator guides; generic, no deployment details
 ```
 
-The seam between `amt` and `amt-mcp` is load-bearing: the library must stay usable
-without an MCP runtime.
+No MCP types cross from `amt-mcp` into `amt`. The library must stay usable without an
+MCP runtime.
 
 ## Adding a tool
 
@@ -66,8 +66,8 @@ the examples before a tool depends on them. Tests run against `amt-fake`.
 - Never weaken the consent flow: no tool may set the consent policy to `none` without a
   dedicated, separately gated operation.
 - Read `get_status` before proposing a write, and confirm with the user before `power`.
-- Passwords are only ever read from files whose path is configured or passed; no tool
-  takes a password as an argument.
+- Passwords are read only from files whose path is configured or passed; no tool takes a
+  password as an argument.
 - When a new failure mode or a step that needs a person at the device turns up, add it
   to `docs/guides/`.
 - **No deployment details in this repo**: no hostnames, IPs, device models or serials,
@@ -79,7 +79,7 @@ the examples before a tool depends on them. Tests run against `amt-fake`.
 All commits must pass `prek run --all-files`:
 
 - `cargo fmt`
-- `cargo clippy --all-targets -- -D warnings` — **`#[allow]` escapes are refused**; fix the
+- `cargo clippy --all-targets -- -D warnings`. **`#[allow]` escapes are refused**: fix the
   lint instead
 - `cargo test --all`
 - `typos`, TOML/YAML validation, markdownlint
