@@ -5,7 +5,7 @@ management over AMT's own protocols: power control, user consent, Serial-over-LA
 IDE-R remote disk, boot overrides, logs, scheduled wake and accounts. No MPS, MeshCentral
 or agent on the target is needed.
 
-Version 0.2.0 <!-- x-release-please-version -->
+Version 0.3.0 <!-- x-release-please-version -->
 
 ## Tools
 
