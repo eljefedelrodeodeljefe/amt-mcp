@@ -11,6 +11,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 
 use crate::digest::Challenge;
 use crate::error::{Error, Result};
+use crate::secret::Secret;
 
 pub const DEFAULT_PORT: u16 = 16992;
 const PATH: &str = "/wsman";
@@ -23,13 +24,13 @@ pub const IPS: &str = "http://intel.com/wbem/wscim/1/ips-schema/1/";
 const ACTION_GET: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Get";
 const ACTION_PUT: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Put";
 
-/// Where and how to reach one AMT device.
+/// Where and how to reach one AMT device. `Debug` shows the password as `***`.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub host: String,
     pub port: u16,
     pub user: String,
-    pub password: String,
+    pub password: Secret,
     pub timeout: Duration,
     /// Accept redirection authentication type 1, which sends the password in
     /// clear over TCP 16994, when the device offers nothing better. Off by
@@ -41,7 +42,7 @@ impl Endpoint {
     pub fn new(
         host: impl Into<String>,
         user: impl Into<String>,
-        password: impl Into<String>,
+        password: impl Into<Secret>,
     ) -> Self {
         Self {
             host: host.into(),
@@ -148,7 +149,7 @@ impl Client {
         if let Some(ch) = ch {
             req = req.header(
                 AUTHORIZATION,
-                ch.authorization(&self.ep.user, &self.ep.password, "POST", PATH),
+                ch.authorization(&self.ep.user, self.ep.password.expose(), "POST", PATH),
             );
         }
         Ok(req.send().await?)
@@ -530,6 +531,17 @@ mod tests {
             Some("The specified resource is not supported. a:Sender")
         );
         assert!(fault_reason(REDIR).is_none());
+    }
+
+    #[test]
+    fn endpoint_debug_hides_the_password() {
+        let ep = Endpoint::new("192.0.2.10", "admin", "hunter2!X");
+        let shown = format!("{ep:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(
+            shown.contains("192.0.2.10") && shown.contains("admin"),
+            "{shown}"
+        );
     }
 
     #[test]

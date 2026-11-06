@@ -1,6 +1,9 @@
 //! Environment parsing. Strict: a value that is not understood is a startup
 //! error naming the variable, never a silent default.
 
+use amt::Secret;
+use anyhow::Context;
+
 /// Parses a boolean setting: `true`/`false`, `1`/`0`, `yes`/`no`, any case.
 pub fn parse_bool(name: &str, value: &str) -> anyhow::Result<bool> {
     match value.to_ascii_lowercase().as_str() {
@@ -19,9 +22,28 @@ pub fn bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
+/// A password from a file, without its trailing newline, held as a
+/// [`Secret`] from the moment it is read.
+pub fn read_secret(path: &str, what: &str) -> anyhow::Result<Secret> {
+    let mut s = std::fs::read_to_string(path).with_context(|| format!("reading {what} {path}"))?;
+    let len = s.trim_end_matches(['\r', '\n']).len();
+    s.truncate(len);
+    Ok(Secret::from(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_file_loses_its_newline_and_hides_in_debug() {
+        let path = std::env::temp_dir().join(format!("amt-mcp-secret-{}", std::process::id()));
+        std::fs::write(&path, "hunter2!X\r\n").unwrap();
+        let s = read_secret(path.to_str().unwrap(), "test").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(s.expose(), "hunter2!X");
+        assert_eq!(format!("{s:?}"), "***");
+    }
 
     #[test]
     fn booleans_in_any_case() {

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use amt::{Client, Device, Endpoint, IderSession, KvmSession, SolSession};
+use amt::{Client, Device, Endpoint, IderSession, KvmSession, Secret, SolSession};
 use anyhow::Context;
 use base64::Engine;
 use rmcp::{
@@ -17,7 +17,7 @@ use rmcp::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::config;
+use crate::config::{self, read_secret};
 use crate::error::tool_error;
 use crate::guides;
 use crate::logging;
@@ -39,7 +39,7 @@ pub struct AmtServer {
     /// KVM over the redirection port (default) or the VNC port 5900.
     kvm_over_vnc: bool,
     /// The RFB password set by kvm_enable, or read from AMT_RFB_PASSWORD_FILE.
-    rfb_password: Mutex<Option<String>>,
+    rfb_password: Mutex<Option<Secret>>,
     ider: Mutex<Option<IderSession>>,
 }
 
@@ -51,11 +51,8 @@ impl AmtServer {
             std::env::var("AMT_PASSWORD_FILE"),
             std::env::var("AMT_PASSWORD"),
         ) {
-            (Ok(path), _) => std::fs::read_to_string(&path)
-                .with_context(|| format!("reading AMT_PASSWORD_FILE {path}"))?
-                .trim_end_matches(['\r', '\n'])
-                .to_string(),
-            (Err(_), Ok(p)) => p,
+            (Ok(path), _) => read_secret(&path, "AMT_PASSWORD_FILE")?,
+            (Err(_), Ok(p)) => Secret::from(p),
             _ => anyhow::bail!("set AMT_PASSWORD_FILE (preferred) or AMT_PASSWORD"),
         };
         let timeout_ms: u64 = std::env::var("AMT_TIMEOUT_MS")
@@ -81,10 +78,7 @@ impl AmtServer {
             std::env::var("AMT_READ_PASSWORD_FILE"),
         ) {
             (Ok(u), Ok(path)) => {
-                let p = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading AMT_READ_PASSWORD_FILE {path}"))?
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string();
+                let p = read_secret(&path, "AMT_READ_PASSWORD_FILE")?;
                 let mut r = Endpoint::new(host, u, p);
                 r.port = port;
                 r.timeout = timeout;
@@ -155,7 +149,7 @@ impl AmtServer {
                         None,
                     )
                 })?;
-                KvmSession::open(&ep.host, amt::kvm::VNC_PORT, &pw, self.timeout).await
+                KvmSession::open(&ep.host, amt::kvm::VNC_PORT, pw.expose(), self.timeout).await
             } else {
                 KvmSession::open_redirection(ep, self.sol_port, self.timeout).await
             }
@@ -533,7 +527,7 @@ impl AmtServer {
         let state = match &p.rfb_password_file {
             Some(path) => {
                 let pw = read_secret(path, "rfb_password_file").map_err(tool_error)?;
-                let res = self.device.enable_kvm(&pw).await;
+                let res = self.device.enable_kvm(pw.expose()).await;
                 logging::write_tool("kvm_enable", "port_5900=true", &res);
                 let state = res.map_err(|e| tool_error(e.into()))?;
                 *self.rfb_password.lock().await = Some(pw);
@@ -755,13 +749,6 @@ const INSTRUCTIONS: &str = concat!(
     "Operator guides (setup incl. steps that need a human, security, recipes, troubleshooting): ",
     "list_guides / get_guide, also as resources amt://guide/<name>.",
 );
-
-fn read_secret(path: &str, what: &str) -> anyhow::Result<String> {
-    Ok(std::fs::read_to_string(path)
-        .with_context(|| format!("reading {what} {path}"))?
-        .trim_end_matches(['\r', '\n'])
-        .to_string())
-}
 
 fn env_port(key: &str, default: u16) -> anyhow::Result<u16> {
     match std::env::var(key) {

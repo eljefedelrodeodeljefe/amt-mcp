@@ -143,7 +143,7 @@ async fn start_and_authenticate(
         let resp = DigestInput {
             user: &ep.user,
             realm: &realm,
-            password: &ep.password,
+            password: ep.password.expose(),
             method: "POST",
             uri: AUTH_URI,
             nonce: &nonce,
@@ -179,7 +179,7 @@ async fn start_and_authenticate(
             host = %ep.host,
             "redirection: device offers only plaintext authentication; sending the password in clear"
         );
-        let (user, pass) = (ep.user.as_bytes(), ep.password.as_bytes());
+        let (user, pass) = (ep.user.as_bytes(), ep.password.expose().as_bytes());
         let mut f = vec![msg::AUTHENTICATE, 0, 0, 0, auth::PASSWORD];
         f.extend_from_slice(&((user.len() + pass.len() + 2) as u32).to_le_bytes());
         push_str(&mut f, user);
