@@ -3,11 +3,11 @@
 AMT is a second computer inside the host with network access, power control and,
 when enabled, keyboard, screen and disk access. Treat its ports like a BMC's.
 
-## Network exposure
+## A host firewall does not protect the AMT ports
 
 | Port | What |
 | --- | --- |
-| 16992 | WS-Man over HTTP (digest auth) — everything this server does |
+| 16992 | WS-Man over HTTP (digest auth): everything this server does |
 | 16993 | WS-Man over TLS (closed until TLS is configured) |
 | 16994 | Redirection: SOL, IDE-R (plain) |
 | 16995 | Redirection over TLS |
@@ -31,15 +31,16 @@ when enabled, keyboard, screen and disk access. Treat its ports like a BMC's.
 - Plain HTTP (16992) protects credentials with digest auth, but the traffic itself is
   unencrypted. Prefer TLS (16993/16995) where the network is not trusted.
 
-## Control mode
+## In client control mode, root on the host can deprovision AMT
 
 - In client control mode, root on the host can deprovision AMT. If untrusted code
   runs as root (CI jobs with Docker, for example), it can turn remote management off,
   but it cannot use AMT to take over the machine without the AMT password.
-- Admin control mode closes that hole and allows turning consent off. Only turn
+- Admin control mode prevents that (deprovisioning needs the AMT admin password) and
+  allows turning consent off. Only turn
   consent off when the network exposure above is locked down.
 
-## Firmware
+## Old ME firmware has network-reachable vulnerabilities
 
 - Several severe AMT vulnerabilities were network-reachable through 16992–16995. Keep
   ME firmware current. Some vendors ship ME firmware only as a Windows updater, and
@@ -48,7 +49,8 @@ when enabled, keyboard, screen and disk access. Treat its ports like a BMC's.
 
 ## Hygiene
 
-- Disable KVM (`kvm_disable`) when not in use; it is the most powerful feature.
+- Disable KVM (`kvm_disable`) when not in use: it gives full keyboard and screen control
+  of the host.
 - KVM over the redirection port needs no VNC port: leave 5900 closed unless a plain
   VNC client must connect.
 - Review the audit log (`get_audit_log`): power actions, SOL/IDE-R/KVM sessions,

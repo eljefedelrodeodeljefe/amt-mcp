@@ -34,9 +34,9 @@ unattended console, or a host that runs untrusted code as root, use ACM.
      **Human:** a full AC drain (unplug ≥ 30 s) usually fixes it.
 4. `rpc amtinfo` reports `activated in client control mode`.
 
-The AMT password: 8–32 characters with upper, lower, digit and a symbol, none of
-`"` `,` `:`. Keep it in a file (mode 600) and point `AMT_PASSWORD_FILE` at it. Never
-in a repository.
+The AMT password has 8–32 characters with upper, lower, digit and a symbol, and none of
+`"` `,` `:`. Keep it in a file (mode 600) and point `AMT_PASSWORD_FILE` at it, and keep it
+out of any repository.
 
 **Human (MEBx only):** MEBx always uses the US keyboard layout. Choose a password
 whose characters are in the same place on the local layout.
@@ -48,9 +48,9 @@ whose characters are in the same place on the local layout.
 - Open the redirection listener: `enable_sol_listener`.
 - KVM: `kvm_enable`. That is all the default transport (KVM inside a redirection
   session on 16994) needs. Only for `AMT_KVM_TRANSPORT=vnc` pass an RFB password file
-  (exactly 8 characters, upper, lower, digit, symbol), which also opens port 5900.
+  (8 characters, no more and no fewer, with upper, lower, digit and symbol), which also opens port 5900.
 - Keep the display at or below AMT's KVM framebuffer limit (~9.2 MB: 1920x1080 at 16
-  bits is fine, 3840x2160 is not), e.g. with `video=1920x1080` on the kernel command line.
+  bits fits, 3840x2160 exceeds it), e.g. with `video=1920x1080` on the kernel command line.
 - Check with `get_status` and `get_boot_options`.
 
 ## 5. Host side for a serial console
