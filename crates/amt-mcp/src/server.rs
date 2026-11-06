@@ -47,14 +47,7 @@ impl AmtServer {
     pub fn from_env() -> anyhow::Result<Self> {
         let host = std::env::var("AMT_HOST").context("AMT_HOST not set")?;
         let user = std::env::var("AMT_USER").unwrap_or_else(|_| "admin".into());
-        let password = match (
-            std::env::var("AMT_PASSWORD_FILE"),
-            std::env::var("AMT_PASSWORD"),
-        ) {
-            (Ok(path), _) => read_secret(&path, "AMT_PASSWORD_FILE")?,
-            (Err(_), Ok(p)) => Secret::from(p),
-            _ => anyhow::bail!("set AMT_PASSWORD_FILE (preferred) or AMT_PASSWORD"),
-        };
+        let password = config::admin_password(|k| std::env::var(k).ok())?;
         let timeout_ms: u64 = std::env::var("AMT_TIMEOUT_MS")
             .unwrap_or_else(|_| "15000".into())
             .parse()
@@ -737,7 +730,7 @@ impl ServerHandler for AmtServer {
 const INSTRUCTIONS: &str = concat!(
     "Intel AMT out-of-band management over WS-Man (HTTP digest, port 16992) and the ",
     "redirection protocol (Serial-over-LAN, port 16994). Configure with AMT_HOST and ",
-    "AMT_PASSWORD_FILE (or AMT_PASSWORD). Optional: AMT_USER (default admin), AMT_PORT, ",
+    "AMT_PASSWORD_FILE (a file holding the admin password). Optional: AMT_USER (default admin), AMT_PORT, ",
     "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_READ_USER + AMT_READ_PASSWORD_FILE ",
     "(a least-privilege account used for read tools), AMT_KVM_TRANSPORT (redirection or vnc), AMT_RFB_PASSWORD_FILE (KVM over vnc), AMT_ALLOW_PLAINTEXT_AUTH (default false; lets SOL, IDE-R and KVM fall back to sending the password in clear when a device offers no digest), AMT_ALLOW_WRITES (default false — must ",
     "be 'true' for power, consent and console tools; true/false, 1/0 or yes/no, anything else ",

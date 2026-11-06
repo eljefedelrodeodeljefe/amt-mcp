@@ -22,6 +22,20 @@ pub fn bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
     }
 }
 
+/// The admin password, from the file AMT_PASSWORD_FILE names. `var` reads
+/// an environment variable. A password in the environment (the old
+/// AMT_PASSWORD) is refused rather than ignored, so it gets removed: the
+/// environment is visible to child processes and in /proc.
+pub fn admin_password(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Secret> {
+    if var("AMT_PASSWORD").is_some() {
+        anyhow::bail!(
+            "AMT_PASSWORD is no longer read: put the password in a file (mode 600), set AMT_PASSWORD_FILE to its path and unset AMT_PASSWORD"
+        );
+    }
+    let path = var("AMT_PASSWORD_FILE").context("AMT_PASSWORD_FILE not set")?;
+    read_secret(&path, "AMT_PASSWORD_FILE")
+}
+
 /// A password from a file, without its trailing newline, held as a
 /// [`Secret`] from the moment it is read.
 pub fn read_secret(path: &str, what: &str) -> anyhow::Result<Secret> {
@@ -43,6 +57,21 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(s.expose(), "hunter2!X");
         assert_eq!(format!("{s:?}"), "***");
+    }
+
+    #[test]
+    fn password_in_the_environment_is_refused() {
+        let env = |k: &str| (k == "AMT_PASSWORD").then(|| "hunter2!X".to_string());
+        let err = admin_password(env).expect_err("AMT_PASSWORD must not be read");
+        let msg = err.to_string();
+        assert!(msg.contains("AMT_PASSWORD_FILE"), "{msg}");
+        assert!(!msg.contains("hunter2"), "{msg}");
+    }
+
+    #[test]
+    fn password_file_is_required() {
+        let err = admin_password(|_| None).expect_err("no password configured");
+        assert!(err.to_string().contains("AMT_PASSWORD_FILE"), "{err}");
     }
 
     #[test]

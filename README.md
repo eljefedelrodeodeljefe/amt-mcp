@@ -45,8 +45,7 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 | Variable | Default | |
 | --- | --- | --- |
 | `AMT_HOST` | — | Device address (AMT shares the host OS's IP in DHCP mode) |
-| `AMT_PASSWORD_FILE` | — | File holding the AMT admin password (preferred) |
-| `AMT_PASSWORD` | — | The password itself, if no file is given |
+| `AMT_PASSWORD_FILE` | — | File holding the AMT admin password. Passwords are read only from files; a set `AMT_PASSWORD` stops the server |
 | `AMT_USER` | `admin` | |
 | `AMT_PORT` | `16992` | WS-Man (HTTP digest) |
 | `AMT_SOL_PORT` | `16994` | Redirection protocol |
