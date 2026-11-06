@@ -75,7 +75,7 @@ impl Device {
     pub async fn clock(&self) -> Result<Clock> {
         let xml = self
             .client()
-            .call(&format!("{AMT}{TIME}"), "GetLowAccuracyTimeSynch", &[], "")
+            .call_read(&format!("{AMT}{TIME}"), "GetLowAccuracyTimeSynch", &[], "")
             .await?;
         if field_u32(&xml, "ReturnValue")? != 0 {
             return Err(Error::ReturnValue {
@@ -99,7 +99,7 @@ impl Device {
         let uri = format!("{AMT}{TIME}");
         let xml = self
             .client()
-            .call(&uri, "GetLowAccuracyTimeSynch", &[], "")
+            .call_read(&uri, "GetLowAccuracyTimeSynch", &[], "")
             .await?;
         let ta0 = field_u32(&xml, "Ta0")?;
         let tm = now_unix();

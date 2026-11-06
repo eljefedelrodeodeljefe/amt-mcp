@@ -116,7 +116,7 @@ impl Device {
         let sel = [("Name", SERVICE)];
         let xml = self
             .client()
-            .call(
+            .call_read(
                 &uri,
                 "EnumerateUserAclEntries",
                 &sel,
@@ -130,7 +130,7 @@ impl Device {
             };
             let e = self
                 .client()
-                .call(
+                .call_read(
                     &uri,
                     "GetUserAclEntryEx",
                     &sel,
