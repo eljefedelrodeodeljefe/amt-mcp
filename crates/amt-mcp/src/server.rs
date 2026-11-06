@@ -68,6 +68,12 @@ impl AmtServer {
 
         let mut ep = Endpoint::new(host.clone(), user, password);
         ep.port = port;
+        ep.allow_plaintext_auth = config::bool_env("AMT_ALLOW_PLAINTEXT_AUTH", false)?;
+        if ep.allow_plaintext_auth {
+            tracing::warn!(
+                "AMT_ALLOW_PLAINTEXT_AUTH is set: a device that offers only plaintext redirection auth gets the admin password in clear"
+            );
+        }
         ep.timeout = Duration::from_millis(timeout_ms);
         let timeout = ep.timeout;
         let reader = match (
@@ -739,7 +745,7 @@ const INSTRUCTIONS: &str = concat!(
     "redirection protocol (Serial-over-LAN, port 16994). Configure with AMT_HOST and ",
     "AMT_PASSWORD_FILE (or AMT_PASSWORD). Optional: AMT_USER (default admin), AMT_PORT, ",
     "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_READ_USER + AMT_READ_PASSWORD_FILE ",
-    "(a least-privilege account used for read tools), AMT_KVM_TRANSPORT (redirection or vnc), AMT_RFB_PASSWORD_FILE (KVM over vnc), AMT_ALLOW_WRITES (default false — must ",
+    "(a least-privilege account used for read tools), AMT_KVM_TRANSPORT (redirection or vnc), AMT_RFB_PASSWORD_FILE (KVM over vnc), AMT_ALLOW_PLAINTEXT_AUTH (default false; lets SOL, IDE-R and KVM fall back to sending the password in clear when a device offers no digest), AMT_ALLOW_WRITES (default false — must ",
     "be 'true' for power, consent and console tools; true/false, 1/0 or yes/no, anything else ",
     "stops the server). ",
     "Power actions are immediate and bypass the OS. In client control mode every SOL, ",

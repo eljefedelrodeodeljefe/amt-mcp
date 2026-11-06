@@ -31,6 +31,10 @@ pub struct Endpoint {
     pub user: String,
     pub password: String,
     pub timeout: Duration,
+    /// Accept redirection authentication type 1, which sends the password in
+    /// clear over TCP 16994, when the device offers nothing better. Off by
+    /// default: anyone on the path can strip digest from the offer to force it.
+    pub allow_plaintext_auth: bool,
 }
 
 impl Endpoint {
@@ -45,6 +49,7 @@ impl Endpoint {
             user: user.into(),
             password: password.into(),
             timeout: Duration::from_secs(15),
+            allow_plaintext_auth: false,
         }
     }
 }

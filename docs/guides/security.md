@@ -30,6 +30,11 @@ when enabled, keyboard, screen and disk access. Treat its ports like a BMC's.
 - Use a read-only account for monitoring (`add_account` with no realms).
 - Plain HTTP (16992) protects credentials with digest auth, but the traffic itself is
   unencrypted. Prefer TLS (16993/16995) where the network is not trusted.
+- Redirection (16994) authenticates with digest. If a device offers only the
+  plaintext type, the session is refused: the password would cross the network in
+  clear, and anyone on the path can force that by editing the offer. Set
+  `AMT_ALLOW_PLAINTEXT_AUTH=true` only for old firmware on a trusted segment; the
+  server logs a warning when it is set.
 
 ## In client control mode, root on the host can deprovision AMT
 

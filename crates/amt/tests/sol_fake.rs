@@ -69,3 +69,45 @@ async fn read_times_out_empty_when_idle() {
         .unwrap();
     assert!(got.is_empty() || got == b"");
 }
+
+#[tokio::test]
+async fn plaintext_only_device_is_refused_by_default() {
+    let fake = FakeRedirection::start_plaintext_only("admin", "S3cret!pw", "").await;
+    let res = SolSession::open(
+        &endpoint(&fake, "S3cret!pw"),
+        fake.addr.port(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let seen = fake.seen.lock().await.clone();
+    assert_eq!(
+        seen.plaintext_password, None,
+        "the password went out in clear"
+    );
+    let err = res.err().expect("refused");
+    assert!(matches!(err, Error::PlaintextAuthRefused), "{err}");
+}
+
+#[tokio::test]
+async fn plaintext_auth_works_when_opted_in() {
+    let fake = FakeRedirection::start_plaintext_only("admin", "S3cret!pw", "login: ").await;
+    let mut ep = endpoint(&fake, "S3cret!pw");
+    ep.allow_plaintext_auth = true;
+    let sol = SolSession::open(&ep, fake.addr.port(), Duration::from_secs(5))
+        .await
+        .expect("session opens");
+    assert!(fake.seen.lock().await.authenticated);
+    sol.close().await;
+}
+
+#[tokio::test]
+async fn digest_is_used_even_when_plaintext_is_allowed() {
+    let fake = FakeRedirection::start("admin", "S3cret!pw", "").await;
+    let mut ep = endpoint(&fake, "S3cret!pw");
+    ep.allow_plaintext_auth = true;
+    let sol = SolSession::open(&ep, fake.addr.port(), Duration::from_secs(5))
+        .await
+        .expect("session opens");
+    assert_eq!(fake.seen.lock().await.plaintext_password, None);
+    sol.close().await;
+}

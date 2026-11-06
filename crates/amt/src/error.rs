@@ -34,6 +34,11 @@ pub enum Error {
     #[error("redirection protocol error: {0}")]
     Protocol(String),
 
+    #[error(
+        "the device offers only plaintext redirection authentication, which sends the password in clear; refused unless Endpoint::allow_plaintext_auth is set"
+    )]
+    PlaintextAuthRefused,
+
     #[error("redirection session authentication failed (status {0})")]
     RedirectionAuth(u8),
 

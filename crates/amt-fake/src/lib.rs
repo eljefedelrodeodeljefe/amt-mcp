@@ -29,6 +29,8 @@ pub struct Seen {
     pub settings_received: bool,
     pub typed: Vec<u8>,
     pub keepalives: usize,
+    /// The password a client sent in clear (auth type 1), if any.
+    pub plaintext_password: Option<String>,
 }
 
 pub struct FakeRedirection {
@@ -36,20 +38,40 @@ pub struct FakeRedirection {
     pub seen: Arc<Mutex<Seen>>,
 }
 
+/// Which authentication types the fake offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offer {
+    Digest,
+    /// Only type 1, the password in clear: old firmware, or a downgrade by
+    /// someone on the path.
+    PlaintextOnly,
+}
+
 impl FakeRedirection {
     /// Starts a fake accepting one session, authenticating `user`/`password`.
     /// It greets with `banner` once SOL is up.
     pub async fn start(user: &str, password: &str, banner: &str) -> Self {
-        Self::start_kind(user, password, banner, false).await
+        Self::start_kind(user, password, banner, false, Offer::Digest).await
+    }
+
+    /// A SOL fake that offers only plaintext authentication (type 1).
+    pub async fn start_plaintext_only(user: &str, password: &str, banner: &str) -> Self {
+        Self::start_kind(user, password, banner, false, Offer::PlaintextOnly).await
     }
 
     /// An IDE-R fake: after authentication it opens the session, then issues
     /// READ CAPACITY and a READ(10) of `read_blocks` blocks from block 1.
     pub async fn start_ider(user: &str, password: &str) -> Self {
-        Self::start_kind(user, password, "", true).await
+        Self::start_kind(user, password, "", true, Offer::Digest).await
     }
 
-    async fn start_kind(user: &str, password: &str, banner: &str, ider: bool) -> Self {
+    async fn start_kind(
+        user: &str,
+        password: &str,
+        banner: &str,
+        ider: bool,
+        offer: Offer,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let seen = Arc::new(Mutex::new(Seen::default()));
@@ -60,7 +82,7 @@ impl FakeRedirection {
                 let _ = if ider {
                     serve_ider(sock, &user, &password, s).await
                 } else {
-                    serve(sock, &user, &password, &banner, s).await
+                    serve(sock, &user, &password, &banner, offer, s).await
                 };
             }
         });
@@ -110,6 +132,7 @@ async fn start_and_auth(
     sock: &mut TcpStream,
     user: &str,
     password: &str,
+    offer: Offer,
     seen: &Arc<Mutex<Seen>>,
 ) -> std::io::Result<bool> {
     // StartRedirectionSession(kind) -> reply with no OEM data.
@@ -125,7 +148,25 @@ async fn start_and_auth(
         let len = u32::from_le_bytes([h[5], h[6], h[7], h[8]]) as usize;
         let data = read_n(sock, len).await?;
         match h[4] {
-            0 => sock.write_all(&auth_reply(0, 0, &[1, 4])).await?,
+            0 => {
+                let types: &[u8] = match offer {
+                    Offer::Digest => &[1, 4],
+                    Offer::PlaintextOnly => &[1],
+                };
+                sock.write_all(&auth_reply(0, 0, types)).await?
+            }
+            1 => {
+                let f = strings(&data);
+                let ok = f.first().map(String::as_str) == Some(user)
+                    && f.get(1).map(String::as_str) == Some(password);
+                seen.lock().await.plaintext_password = f.get(1).cloned();
+                sock.write_all(&auth_reply(if ok { 0 } else { 2 }, 1, &[]))
+                    .await?;
+                if ok {
+                    seen.lock().await.authenticated = true;
+                }
+                return Ok(ok);
+            }
             4 => {
                 let f = strings(&data);
                 // [user, realm, nonce, uri, cnonce, nc, response, qop]
@@ -160,9 +201,10 @@ async fn serve(
     user: &str,
     password: &str,
     banner: &str,
+    offer: Offer,
     seen: Arc<Mutex<Seen>>,
 ) -> std::io::Result<()> {
-    if !start_and_auth(&mut sock, user, password, &seen).await? {
+    if !start_and_auth(&mut sock, user, password, offer, &seen).await? {
         return Ok(());
     }
 
@@ -240,7 +282,7 @@ async fn serve_ider(
     password: &str,
     seen: Arc<Mutex<Seen>>,
 ) -> std::io::Result<()> {
-    if !start_and_auth(&mut sock, user, password, &seen).await? {
+    if !start_and_auth(&mut sock, user, password, Offer::Digest, &seen).await? {
         return Ok(());
     }
     // OPEN_SESSION from the client: header + 10 bytes of parameters.
