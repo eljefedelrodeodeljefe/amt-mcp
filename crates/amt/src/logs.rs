@@ -97,10 +97,12 @@ impl Device {
                     out.push(r);
                 }
             }
-            if got == 0 || start + got > total {
-                break;
+            // `got` comes from the device: a count that would run the index
+            // past u32 ends the paging instead of overflowing.
+            match start.checked_add(got) {
+                Some(next) if got != 0 && next <= total => start = next,
+                _ => break,
             }
-            start += got;
         }
         Ok(out)
     }
