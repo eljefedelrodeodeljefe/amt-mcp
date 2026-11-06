@@ -9,6 +9,7 @@
 | `add_alarm`: "XML content is not valid" | Start time after 2037 (AMT's clock is 32-bit) | Use an earlier date |
 | Tool calls fail intermittently in parallel | AMT's web server handles only a few concurrent connections | This server serializes requests per device; for other clients, do the same |
 | `kvm_screenshot`: AMT resets the connection | The framebuffer is over AMT's ~9.2 MB KVM limit (3840x2160 at 16 bits is), or a client offered no RLE/ZRLE or asked for a partial region | Lower the display or console resolution (e.g. `video=1920x1080` on the kernel command line). This server already offers ZRLE and requests the whole screen |
+| `sol_open`/`ider_start`/KVM: "offers only plaintext redirection authentication" | The device did not offer digest: old firmware, or the offer was altered on the path | Check the firmware version and the path first. On a trusted segment with old firmware, `AMT_ALLOW_PLAINTEXT_AUTH=true` |
 | `sol_open`: StartRedirectionSession refused | Listener closed or SOL disabled | `enable_sol_listener`; `get_status` → `redirection` |
 | Nothing answers on 16992 | AMT not provisioned, network access not activated, or filtered | `rpc amtinfo` on the host; check `get_network` from a reachable host |
 | `ping` answers while the host is rebooting | AMT answers ping on the shared IP | Use `get_status` (power state) or the host's own services instead |

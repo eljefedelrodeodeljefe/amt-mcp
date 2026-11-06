@@ -29,6 +29,8 @@ pub struct Seen {
     pub settings_received: bool,
     pub typed: Vec<u8>,
     pub keepalives: usize,
+    /// The password a client sent in clear (auth type 1), if any.
+    pub plaintext_password: Option<String>,
 }
 
 pub struct FakeRedirection {
@@ -36,20 +38,40 @@ pub struct FakeRedirection {
     pub seen: Arc<Mutex<Seen>>,
 }
 
+/// Which authentication types the fake offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offer {
+    Digest,
+    /// Only type 1, the password in clear: old firmware, or a downgrade by
+    /// someone on the path.
+    PlaintextOnly,
+}
+
 impl FakeRedirection {
     /// Starts a fake accepting one session, authenticating `user`/`password`.
     /// It greets with `banner` once SOL is up.
     pub async fn start(user: &str, password: &str, banner: &str) -> Self {
-        Self::start_kind(user, password, banner, false).await
+        Self::start_kind(user, password, banner, false, Offer::Digest).await
+    }
+
+    /// A SOL fake that offers only plaintext authentication (type 1).
+    pub async fn start_plaintext_only(user: &str, password: &str, banner: &str) -> Self {
+        Self::start_kind(user, password, banner, false, Offer::PlaintextOnly).await
     }
 
     /// An IDE-R fake: after authentication it opens the session, then issues
     /// READ CAPACITY and a READ(10) of `read_blocks` blocks from block 1.
     pub async fn start_ider(user: &str, password: &str) -> Self {
-        Self::start_kind(user, password, "", true).await
+        Self::start_kind(user, password, "", true, Offer::Digest).await
     }
 
-    async fn start_kind(user: &str, password: &str, banner: &str, ider: bool) -> Self {
+    async fn start_kind(
+        user: &str,
+        password: &str,
+        banner: &str,
+        ider: bool,
+        offer: Offer,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let seen = Arc::new(Mutex::new(Seen::default()));
@@ -60,7 +82,7 @@ impl FakeRedirection {
                 let _ = if ider {
                     serve_ider(sock, &user, &password, s).await
                 } else {
-                    serve(sock, &user, &password, &banner, s).await
+                    serve(sock, &user, &password, &banner, offer, s).await
                 };
             }
         });
@@ -110,6 +132,7 @@ async fn start_and_auth(
     sock: &mut TcpStream,
     user: &str,
     password: &str,
+    offer: Offer,
     seen: &Arc<Mutex<Seen>>,
 ) -> std::io::Result<bool> {
     // StartRedirectionSession(kind) -> reply with no OEM data.
@@ -125,7 +148,25 @@ async fn start_and_auth(
         let len = u32::from_le_bytes([h[5], h[6], h[7], h[8]]) as usize;
         let data = read_n(sock, len).await?;
         match h[4] {
-            0 => sock.write_all(&auth_reply(0, 0, &[1, 4])).await?,
+            0 => {
+                let types: &[u8] = match offer {
+                    Offer::Digest => &[1, 4],
+                    Offer::PlaintextOnly => &[1],
+                };
+                sock.write_all(&auth_reply(0, 0, types)).await?
+            }
+            1 => {
+                let f = strings(&data);
+                let ok = f.first().map(String::as_str) == Some(user)
+                    && f.get(1).map(String::as_str) == Some(password);
+                seen.lock().await.plaintext_password = f.get(1).cloned();
+                sock.write_all(&auth_reply(if ok { 0 } else { 2 }, 1, &[]))
+                    .await?;
+                if ok {
+                    seen.lock().await.authenticated = true;
+                }
+                return Ok(ok);
+            }
             4 => {
                 let f = strings(&data);
                 // [user, realm, nonce, uri, cnonce, nc, response, qop]
@@ -160,9 +201,10 @@ async fn serve(
     user: &str,
     password: &str,
     banner: &str,
+    offer: Offer,
     seen: Arc<Mutex<Seen>>,
 ) -> std::io::Result<()> {
-    if !start_and_auth(&mut sock, user, password, &seen).await? {
+    if !start_and_auth(&mut sock, user, password, offer, &seen).await? {
         return Ok(());
     }
 
@@ -240,7 +282,7 @@ async fn serve_ider(
     password: &str,
     seen: Arc<Mutex<Seen>>,
 ) -> std::io::Result<()> {
-    if !start_and_auth(&mut sock, user, password, &seen).await? {
+    if !start_and_auth(&mut sock, user, password, Offer::Digest, &seen).await? {
         return Ok(());
     }
     // OPEN_SESSION from the client: header + 10 bytes of parameters.
@@ -280,4 +322,105 @@ async fn serve_ider(
     let mut rest = [0u8; 64];
     while sock.read(&mut rest).await? > 0 {}
     Ok(())
+}
+
+/// What [`FakeWsman`] does with one request it has read in full.
+#[derive(Debug, Clone)]
+pub enum WsmanStep {
+    /// Answers 200 with this SOAP body.
+    Respond(String),
+    /// Closes the connection without answering, as a device that executed the
+    /// request and then reset would.
+    Drop,
+    /// Never answers, holding the connection open: the client times out.
+    Hang,
+}
+
+/// A scripted fake of AMT's WS-Man HTTP endpoint (no digest challenge). It
+/// reads each request in full, records its body, then follows the next step of
+/// the script; past the end of the script it answers with an empty body.
+pub struct FakeWsman {
+    pub addr: SocketAddr,
+    /// The body of every request received, in order.
+    pub requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeWsman {
+    pub async fn start(script: Vec<WsmanStep>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(std::collections::VecDeque::from(script)));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (seen, script) = (seen.clone(), script.clone());
+                tokio::spawn(async move {
+                    let _ = serve_wsman(sock, seen, script).await;
+                });
+            }
+        });
+        Self { addr, requests }
+    }
+
+    /// How many requests reached the fake.
+    pub async fn count(&self) -> usize {
+        self.requests.lock().await.len()
+    }
+}
+
+async fn serve_wsman(
+    mut sock: TcpStream,
+    seen: Arc<Mutex<Vec<String>>>,
+    script: Arc<Mutex<std::collections::VecDeque<WsmanStep>>>,
+) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    loop {
+        // Headers, then a Content-Length body.
+        let head_end = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = sock.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        while buf.len() < head_end + len {
+            let mut chunk = [0u8; 4096];
+            let n = sock.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let body = String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned();
+        buf.drain(..head_end + len);
+        seen.lock().await.push(body);
+        let step = script.lock().await.pop_front();
+        match step {
+            Some(WsmanStep::Drop) => return Ok(()),
+            Some(WsmanStep::Hang) => {
+                std::future::pending::<()>().await;
+            }
+            Some(WsmanStep::Respond(body)) => write_soap(&mut sock, &body).await?,
+            None => write_soap(&mut sock, "").await?,
+        }
+    }
+}
+
+async fn write_soap(sock: &mut TcpStream, body: &str) -> std::io::Result<()> {
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml;charset=UTF-8\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    sock.write_all(resp.as_bytes()).await
 }

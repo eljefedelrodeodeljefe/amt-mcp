@@ -16,14 +16,24 @@ impl Zrle {
         Self { inflate: None }
     }
 
-    /// One rectangle's payload as its tile stream. A rectangle may be a single
+    /// One rectangle's payload as its tile stream, at most `limit` bytes (see
+    /// [`max_tile_bytes`]): more is refused rather than inflated, so a small
+    /// payload cannot expand without bound. A rectangle may be a single
     /// uncompressed deflate block (`00`, LEN, NLEN, data), which AMT sends
     /// outside the compressed stream; MeshCommander takes those as they are.
-    pub fn inflate(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn inflate(&mut self, data: &[u8], limit: usize) -> Result<Vec<u8>> {
+        let too_large = || {
+            Error::Protocol(format!(
+                "ZRLE rectangle inflates past {limit} bytes, more than its tiles can hold"
+            ))
+        };
         if data.len() > 5 && data[0] == 0 {
             let len = u16::from_le_bytes([data[1], data[2]]) as usize;
             let nlen = u16::from_le_bytes([data[3], data[4]]);
             if len == data.len() - 5 && nlen == !(len as u16) {
+                if len > limit {
+                    return Err(too_large());
+                }
                 return Ok(data[5..].to_vec());
             }
         }
@@ -33,11 +43,15 @@ impl Zrle {
                 && u16::from_be_bytes([data[0], data[1]]).is_multiple_of(31);
             Decompress::new(zlib_header)
         });
-        let mut out = Vec::with_capacity(data.len() * 8 + 1024);
+        let mut out = Vec::with_capacity((data.len() * 8 + 1024).min(limit + 1));
         let mut input = data;
         loop {
+            if out.len() > limit {
+                return Err(too_large());
+            }
             if out.capacity() - out.len() < 64 * 1024 {
-                out.reserve(256 * 1024);
+                // Exact, so capacity never runs more than one step past `limit`.
+                out.reserve_exact((256 * 1024).min(limit + 1 - out.len()));
             }
             let (in0, out0) = (z.total_in(), z.total_out());
             z.decompress_vec(input, &mut out, FlushDecompress::Sync)
@@ -51,6 +65,9 @@ impl Zrle {
             let used = (z.total_in() - in0) as usize;
             let produced = z.total_out() - out0;
             input = &input[used..];
+            if out.len() > limit {
+                return Err(too_large());
+            }
             if input.is_empty() && out.capacity() > out.len() {
                 return Ok(out);
             }
@@ -59,6 +76,14 @@ impl Zrle {
             }
         }
     }
+}
+
+/// The most tile-stream bytes a `w` x `h` rectangle of 16-bit pixels can need:
+/// three bytes a pixel (plain RLE with every run of one), plus each 64x64
+/// tile's subencoding byte and a palette of up to 127 colours.
+pub(crate) fn max_tile_bytes(w: usize, h: usize) -> usize {
+    let tiles = w.div_ceil(64) * h.div_ceil(64);
+    w * h * 3 + tiles * (1 + 127 * 2)
 }
 
 /// Decodes a ZRLE tile stream for a `w` x `h` rectangle of 16-bit pixels,
@@ -214,7 +239,7 @@ mod tests {
         let payload = [1u8, 2, 3];
         let mut block = vec![0, 3, 0, 0xFC, 0xFF];
         block.extend_from_slice(&payload);
-        assert_eq!(z.inflate(&block).unwrap(), payload);
+        assert_eq!(z.inflate(&block, 1024).unwrap(), payload);
     }
 
     #[test]
@@ -224,7 +249,37 @@ mod tests {
         let mut buf = Vec::with_capacity(256);
         c.compress_vec(b"zlib wrapped tiles", &mut buf, FlushCompress::Sync)
             .unwrap();
-        assert_eq!(z.inflate(&buf).unwrap(), b"zlib wrapped tiles");
+        assert_eq!(z.inflate(&buf, 1024).unwrap(), b"zlib wrapped tiles");
+    }
+
+    #[test]
+    fn decompression_bomb_is_refused() {
+        // 64 MiB of zeros deflate to a few tens of kilobytes.
+        let mut c = Compress::new(Compression::best(), false);
+        let zeros = vec![0u8; 64 << 20];
+        let mut buf = Vec::with_capacity(1 << 20);
+        c.compress_vec(&zeros, &mut buf, FlushCompress::Sync)
+            .unwrap();
+        assert!(buf.len() < 1 << 20);
+        let limit = max_tile_bytes(64, 64);
+        let err = Zrle::new().inflate(&buf, limit).expect_err("refused");
+        assert!(err.to_string().contains("inflates past"), "{err}");
+    }
+
+    #[test]
+    fn stored_block_over_the_limit_is_refused() {
+        let mut block = vec![0, 3, 0, 0xFC, 0xFF];
+        block.extend_from_slice(&[1, 2, 3]);
+        assert!(Zrle::new().inflate(&block, 2).is_err());
+    }
+
+    #[test]
+    fn output_exactly_at_the_limit_is_accepted() {
+        let mut c = Compress::new(Compression::default(), false);
+        let mut buf = Vec::with_capacity(256);
+        c.compress_vec(b"12345678", &mut buf, FlushCompress::Sync)
+            .unwrap();
+        assert_eq!(Zrle::new().inflate(&buf, 8).unwrap(), b"12345678");
     }
 
     #[test]
@@ -235,7 +290,7 @@ mod tests {
             let mut buf = Vec::with_capacity(256);
             c.compress_vec(chunk, &mut buf, FlushCompress::Sync)
                 .unwrap();
-            assert_eq!(z.inflate(&buf).unwrap(), chunk);
+            assert_eq!(z.inflate(&buf, 1024).unwrap(), chunk);
         }
     }
 }

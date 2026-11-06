@@ -31,6 +31,24 @@ use crate::zrle::{self, Zrle};
 
 pub const VNC_PORT: u16 = 5900;
 
+/// The largest framebuffer accepted from the device, in its native pixel
+/// format (bytes per pixel x width x height). AMT's own limit is about 9.2 MB;
+/// this leaves headroom while keeping a hostile ServerInit or DesktopSize from
+/// sizing a multi-gigabyte allocation.
+pub const MAX_FRAMEBUFFER_BYTES: usize = 16 << 20;
+
+/// Refuses a framebuffer of `w` x `h` pixels at `bpp` bytes each over
+/// [`MAX_FRAMEBUFFER_BYTES`].
+fn check_framebuffer(w: usize, h: usize, bpp: usize) -> Result<()> {
+    let bytes = w.saturating_mul(h).saturating_mul(bpp);
+    if bytes > MAX_FRAMEBUFFER_BYTES {
+        return Err(Error::Protocol(format!(
+            "KVM framebuffer {w}x{h} at {bpp} bytes per pixel is {bytes} bytes, over the limit of {MAX_FRAMEBUFFER_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct KvmState {
     /// CIM_KVMRedirectionSAP EnabledState: 2 enabled, 3 disabled, 6 enabled but offline.
@@ -137,8 +155,11 @@ struct PixelFormat {
 }
 
 impl PixelFormat {
-    fn parse(b: &[u8]) -> Self {
-        Self {
+    /// Parses the 16-byte RFB PIXEL_FORMAT. Refuses what RFB does not allow
+    /// (bits per pixel other than 8, 16 or 32) and true-colour shifts that
+    /// point past the pixel, which would otherwise overflow `v >> shift`.
+    fn parse(b: &[u8]) -> Result<Self> {
+        let f = Self {
             bpp: b[0],
             big_endian: b[2] != 0,
             true_colour: b[3] != 0,
@@ -148,7 +169,20 @@ impl PixelFormat {
                 u16::from_be_bytes([b[8], b[9]]),
             ],
             shift: [b[10], b[11], b[12]],
+        };
+        if !matches!(f.bpp, 8 | 16 | 32) {
+            return Err(Error::Protocol(format!(
+                "RFB pixel format with {} bits per pixel; only 8, 16 or 32 are valid",
+                f.bpp
+            )));
         }
+        if f.true_colour && f.shift.iter().any(|&s| s >= f.bpp) {
+            return Err(Error::Protocol(format!(
+                "RFB pixel format shifts {:?} reach past a {}-bit pixel",
+                f.shift, f.bpp
+            )));
+        }
+        Ok(f)
     }
 
     fn bytes_per_pixel(&self) -> usize {
@@ -300,7 +334,8 @@ impl KvmSession {
         let height = u16::from_be_bytes([init[2], init[3]]);
         // Keep AMT's native pixel format (16-bit RGB565 on AMT 12): AMT does
         // not accept every SetPixelFormat a client might ask for.
-        let format = PixelFormat::parse(&init[4..20]);
+        let format = PixelFormat::parse(&init[4..20])?;
+        check_framebuffer(width as usize, height as usize, format.bytes_per_pixel())?;
         let name_len = u32::from_be_bytes([init[20], init[21], init[22], init[23]]) as usize;
         let mut name = vec![0u8; name_len.min(4096)];
         s.read_exact(&mut name).await?;
@@ -429,9 +464,17 @@ impl KvmSession {
         );
         let enc = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
         if enc == -223 {
+            check_framebuffer(rw, rh, self.format.bytes_per_pixel())?;
             self.width = rw as u16;
             self.height = rh as u16;
             return Ok(true);
+        }
+        // Every rectangle lies inside the framebuffer, which bounds what it
+        // can make us allocate and decode.
+        if x + rw > w || y + rh > h {
+            return Err(Error::Protocol(format!(
+                "RFB rectangle {rw}x{rh} at ({x},{y}) lies outside the {w}x{h} framebuffer"
+            )));
         }
         if enc == 16 {
             let len = self.stream.read_u32().await? as usize;
@@ -440,7 +483,7 @@ impl KvmSession {
             }
             let mut packed = vec![0u8; len];
             self.stream.read_exact(&mut packed).await?;
-            let tiles = self.zrle.inflate(&packed)?;
+            let tiles = self.zrle.inflate(&packed, zrle::max_tile_bytes(rw, rh))?;
             let (format, palette) = (self.format, &self.palette);
             zrle::decode_tiles(&tiles, rw, rh, |cx, cy, v| {
                 let (px, py) = (x + cx, y + cy);
@@ -603,6 +646,158 @@ fn named_key(name: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pixel format block for ServerInit: bpp, depth, big endian, true
+    /// colour, maxima and shifts.
+    fn pixel_format(bpp: u8, max: [u16; 3], shift: [u8; 3]) -> [u8; 16] {
+        let mut f = [0u8; 16];
+        f[0] = bpp;
+        f[1] = bpp.min(24);
+        f[3] = 1;
+        for i in 0..3 {
+            f[4 + 2 * i..6 + 2 * i].copy_from_slice(&max[i].to_be_bytes());
+            f[10 + i] = shift[i];
+        }
+        f
+    }
+
+    const RGB565: ([u16; 3], [u8; 3]) = ([31, 63, 31], [11, 5, 0]);
+
+    /// A fake RFB 3.8 server (security None) that sends ServerInit with
+    /// `width` x `height` and `format`, then `after` once the client's first
+    /// FramebufferUpdateRequest has arrived.
+    async fn fake_rfb(
+        width: u16,
+        height: u16,
+        format: [u8; 16],
+        after: Vec<u8>,
+    ) -> Result<KvmSession> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            s.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut buf = [0u8; 12];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(&[1, 1]).await.unwrap(); // one type: None
+            s.read_u8().await.unwrap();
+            s.write_u32(0).await.unwrap(); // SecurityResult OK
+            s.read_u8().await.unwrap(); // ClientInit
+            let mut init = Vec::new();
+            init.extend_from_slice(&width.to_be_bytes());
+            init.extend_from_slice(&height.to_be_bytes());
+            init.extend_from_slice(&format);
+            init.extend_from_slice(&0u32.to_be_bytes());
+            if s.write_all(&init).await.is_err() {
+                return;
+            }
+            // SetEncodings (4 + 3 x 4), then FramebufferUpdateRequest (10).
+            let mut rest = [0u8; 16 + 10];
+            if s.read_exact(&mut rest).await.is_err() {
+                return;
+            }
+            let _ = s.write_all(&after).await;
+            let mut sink = [0u8; 64];
+            while matches!(s.read(&mut sink).await, Ok(n) if n > 0) {}
+        });
+        let s = TcpStream::connect(addr).await?;
+        KvmSession::rfb(s, Security::None, "fake", Duration::from_secs(2)).await
+    }
+
+    /// A FramebufferUpdate with one rectangle header.
+    fn update(x: u16, y: u16, w: u16, h: u16, enc: i32) -> Vec<u8> {
+        let mut m = vec![0u8, 0, 0, 1];
+        for v in [x, y, w, h] {
+            m.extend_from_slice(&v.to_be_bytes());
+        }
+        m.extend_from_slice(&enc.to_be_bytes());
+        m
+    }
+
+    #[tokio::test]
+    async fn oversized_server_init_is_refused() {
+        let (max, shift) = RGB565;
+        let r = fake_rfb(u16::MAX, u16::MAX, pixel_format(16, max, shift), vec![]).await;
+        let err = r.err().expect("a 65535x65535 framebuffer must be refused");
+        assert!(err.to_string().contains("over the limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn raw_rectangle_outside_the_framebuffer_is_refused() {
+        let (max, shift) = RGB565;
+        let mut kvm = fake_rfb(
+            4,
+            4,
+            pixel_format(16, max, shift),
+            update(0, 0, u16::MAX, u16::MAX, 0),
+        )
+        .await
+        .expect("open");
+        let err = kvm.screenshot().await.expect_err("refused");
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn zrle_rectangle_outside_the_framebuffer_is_refused() {
+        let (max, shift) = RGB565;
+        let mut after = update(2, 2, 4, 4, 16);
+        after.extend_from_slice(&0u32.to_be_bytes());
+        let mut kvm = fake_rfb(4, 4, pixel_format(16, max, shift), after)
+            .await
+            .expect("open");
+        let err = kvm.screenshot().await.expect_err("refused");
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn oversized_desktop_size_is_refused() {
+        let (max, shift) = RGB565;
+        let mut kvm = fake_rfb(
+            4,
+            4,
+            pixel_format(16, max, shift),
+            update(0, 0, u16::MAX, u16::MAX, -223),
+        )
+        .await
+        .expect("open");
+        let err = kvm.screenshot().await.expect_err("refused");
+        assert!(err.to_string().contains("over the limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pixel_shift_past_the_pixel_is_refused() {
+        // A shift of 40 would panic in `v >> shift` on the first pixel.
+        let mut after = update(0, 0, 1, 1, 0);
+        after.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let r = fake_rfb(1, 1, pixel_format(32, [255; 3], [40, 8, 0]), after).await;
+        let mut kvm = match r {
+            Err(e) => {
+                assert!(e.to_string().contains("pixel format"), "{e}");
+                return;
+            }
+            Ok(kvm) => kvm,
+        };
+        let res = kvm.screenshot().await;
+        panic!(
+            "pixel format with shift 40 accepted: {:?}",
+            res.map(|p| p.len())
+        );
+    }
+
+    #[test]
+    fn pixel_format_rules() {
+        let (max, shift) = RGB565;
+        assert!(PixelFormat::parse(&pixel_format(16, max, shift)).is_ok());
+        assert!(PixelFormat::parse(&pixel_format(32, [255; 3], [16, 8, 0])).is_ok());
+        assert!(PixelFormat::parse(&pixel_format(16, max, [16, 5, 0])).is_err());
+        assert!(PixelFormat::parse(&pixel_format(32, [255; 3], [32, 8, 0])).is_err());
+        assert!(PixelFormat::parse(&pixel_format(24, [255; 3], [16, 8, 0])).is_err());
+        assert!(PixelFormat::parse(&pixel_format(0, max, shift)).is_err());
+        // Palette formats carry no shifts to check.
+        let mut indexed = pixel_format(8, [0; 3], [200, 200, 200]);
+        indexed[3] = 0;
+        assert!(PixelFormat::parse(&indexed).is_ok());
+    }
 
     #[test]
     fn vnc_response_is_des_ecb() {

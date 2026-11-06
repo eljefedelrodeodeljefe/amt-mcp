@@ -11,6 +11,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 
 use crate::digest::Challenge;
 use crate::error::{Error, Result};
+use crate::secret::Secret;
 
 pub const DEFAULT_PORT: u16 = 16992;
 const PATH: &str = "/wsman";
@@ -23,21 +24,25 @@ pub const IPS: &str = "http://intel.com/wbem/wscim/1/ips-schema/1/";
 const ACTION_GET: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Get";
 const ACTION_PUT: &str = "http://schemas.xmlsoap.org/ws/2004/09/transfer/Put";
 
-/// Where and how to reach one AMT device.
+/// Where and how to reach one AMT device. `Debug` shows the password as `***`.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub host: String,
     pub port: u16,
     pub user: String,
-    pub password: String,
+    pub password: Secret,
     pub timeout: Duration,
+    /// Accept redirection authentication type 1, which sends the password in
+    /// clear over TCP 16994, when the device offers nothing better. Off by
+    /// default: anyone on the path can strip digest from the offer to force it.
+    pub allow_plaintext_auth: bool,
 }
 
 impl Endpoint {
     pub fn new(
         host: impl Into<String>,
         user: impl Into<String>,
-        password: impl Into<String>,
+        password: impl Into<Secret>,
     ) -> Self {
         Self {
             host: host.into(),
@@ -45,8 +50,20 @@ impl Endpoint {
             user: user.into(),
             password: password.into(),
             timeout: Duration::from_secs(15),
+            allow_plaintext_auth: false,
         }
     }
+}
+
+/// Whether a WS-Man call changes the device, which decides whether it may be
+/// resent after a transport error ([`Client::send`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Call {
+    /// Reads only (Get, Enumerate, Pull, read-only methods): safe to resend.
+    Read,
+    /// Changes state (Put, Delete, most methods): resent only if the request
+    /// certainly never left this machine.
+    Write,
 }
 
 /// A WS-Man client for one device. Cheap to share: requests are independent.
@@ -82,12 +99,20 @@ impl Client {
 
     /// Sends one envelope and returns the response body, answering the digest
     /// challenge if AMT asks for one.
-    pub async fn send(&self, envelope: &str) -> Result<String> {
+    ///
+    /// `kind` decides whether a transport failure may be answered by sending
+    /// again. A request that failed to connect never left and is always
+    /// resent once. Any later failure (reset, connection closed before the
+    /// response, timeout) may come after AMT executed the request, so only a
+    /// [`Call::Read`] is resent then. reqwest files both under
+    /// `is_request()`; only `is_connect()` proves nothing was sent. An idle
+    /// keep-alive that AMT closed before the request was written is retried
+    /// by hyper's pool on its own.
+    pub async fn send(&self, envelope: &str, kind: Call) -> Result<String> {
         let _turn = self.gate.lock().await;
         match self.exchange(envelope).await {
-            // A dropped connection is retried once; AMT closes idle keep-alives.
-            Err(Error::Http(e)) if e.is_connect() || e.is_request() => {
-                tracing::debug!(error = %e, "retrying WS-Man request");
+            Err(Error::Http(e)) if e.is_connect() || (kind == Call::Read && e.is_request()) => {
+                tracing::debug!(error = %e, ?kind, "retrying WS-Man request");
                 self.exchange(envelope).await
             }
             other => other,
@@ -124,7 +149,7 @@ impl Client {
         if let Some(ch) = ch {
             req = req.header(
                 AUTHORIZATION,
-                ch.authorization(&self.ep.user, &self.ep.password, "POST", PATH),
+                ch.authorization(&self.ep.user, self.ep.password.expose(), "POST", PATH),
             );
         }
         Ok(req.send().await?)
@@ -162,19 +187,24 @@ impl Client {
 
     /// `Get` on a singleton resource.
     pub async fn get(&self, resource_uri: &str) -> Result<String> {
-        self.send(&envelope(ACTION_GET, resource_uri, "", "")).await
+        self.send(&envelope(ACTION_GET, resource_uri, "", ""), Call::Read)
+            .await
     }
 
     /// `Put` of a whole instance. `instance_xml` is the body element, which must
     /// declare its own namespace prefix.
     pub async fn put(&self, resource_uri: &str, instance_xml: &str) -> Result<String> {
-        self.send(&envelope(ACTION_PUT, resource_uri, "", instance_xml))
-            .await
+        self.send(
+            &envelope(ACTION_PUT, resource_uri, "", instance_xml),
+            Call::Write,
+        )
+        .await
     }
 
     /// Invokes `method` on `resource_uri` (action `{resource_uri}/{method}`).
     /// `selectors` is a pre-built `<w:SelectorSet>` or empty, `input` the
-    /// contents of `<p:{method}_INPUT>`.
+    /// contents of `<p:{method}_INPUT>`. Treated as a [`Call::Write`]: use
+    /// [`Client::invoke_read`] for methods that only read.
     pub async fn invoke(
         &self,
         resource_uri: &str,
@@ -182,14 +212,43 @@ impl Client {
         selectors: &str,
         input: &str,
     ) -> Result<String> {
+        self.invoke_as(resource_uri, method, selectors, input, Call::Write)
+            .await
+    }
+
+    /// [`Client::invoke`] for a method that only reads (`GetRecords`,
+    /// `GetLowAccuracyTimeSynch`), which may be resent after a dropped
+    /// connection.
+    pub async fn invoke_read(
+        &self,
+        resource_uri: &str,
+        method: &str,
+        selectors: &str,
+        input: &str,
+    ) -> Result<String> {
+        self.invoke_as(resource_uri, method, selectors, input, Call::Read)
+            .await
+    }
+
+    async fn invoke_as(
+        &self,
+        resource_uri: &str,
+        method: &str,
+        selectors: &str,
+        input: &str,
+        kind: Call,
+    ) -> Result<String> {
         let body =
             format!("<p:{method}_INPUT xmlns:p=\"{resource_uri}\">{input}</p:{method}_INPUT>");
-        self.send(&envelope(
-            &format!("{resource_uri}/{method}"),
-            resource_uri,
-            selectors,
-            &body,
-        ))
+        self.send(
+            &envelope(
+                &format!("{resource_uri}/{method}"),
+                resource_uri,
+                selectors,
+                &body,
+            ),
+            kind,
+        )
         .await
     }
 
@@ -203,12 +262,10 @@ impl Client {
 <w:MaxElements>{MAX_ELEMENTS}</w:MaxElements></n:Enumerate>"
         );
         let mut xml = self
-            .send(&envelope(
-                &format!("{ENUMERATION}/Enumerate"),
-                resource_uri,
-                "",
-                &body,
-            ))
+            .send(
+                &envelope(&format!("{ENUMERATION}/Enumerate"), resource_uri, "", &body),
+                Call::Read,
+            )
             .await?;
         let mut out = Vec::new();
         // A safety bound: AMT's largest tables (event log) hold a few hundred.
@@ -225,12 +282,10 @@ impl Client {
 <n:MaxElements>{MAX_ELEMENTS}</n:MaxElements></n:Pull>"
             );
             xml = self
-                .send(&envelope(
-                    &format!("{ENUMERATION}/Pull"),
-                    resource_uri,
-                    "",
-                    &body,
-                ))
+                .send(
+                    &envelope(&format!("{ENUMERATION}/Pull"), resource_uri, "", &body),
+                    Call::Read,
+                )
                 .await?;
         }
         Ok(out)
@@ -240,23 +295,19 @@ impl Client {
 impl Client {
     /// `Get` on one instance of a multi-instance class.
     pub async fn get_with(&self, resource_uri: &str, selectors: &[(&str, &str)]) -> Result<String> {
-        self.send(&envelope(
-            ACTION_GET,
-            resource_uri,
-            &selector_set(selectors),
-            "",
-        ))
+        self.send(
+            &envelope(ACTION_GET, resource_uri, &selector_set(selectors), ""),
+            Call::Read,
+        )
         .await
     }
 
     /// `Delete` of one instance.
     pub async fn delete(&self, resource_uri: &str, selectors: &[(&str, &str)]) -> Result<String> {
-        self.send(&envelope(
-            ACTION_DELETE,
-            resource_uri,
-            &selector_set(selectors),
-            "",
-        ))
+        self.send(
+            &envelope(ACTION_DELETE, resource_uri, &selector_set(selectors), ""),
+            Call::Write,
+        )
         .await
     }
 
@@ -267,16 +318,19 @@ impl Client {
         selectors: &[(&str, &str)],
         instance_xml: &str,
     ) -> Result<String> {
-        self.send(&envelope(
-            ACTION_PUT,
-            resource_uri,
-            &selector_set(selectors),
-            instance_xml,
-        ))
+        self.send(
+            &envelope(
+                ACTION_PUT,
+                resource_uri,
+                &selector_set(selectors),
+                instance_xml,
+            ),
+            Call::Write,
+        )
         .await
     }
 
-    /// [`Client::invoke`] with selectors given as pairs.
+    /// [`Client::invoke`] with selectors given as pairs (a [`Call::Write`]).
     pub async fn call(
         &self,
         resource_uri: &str,
@@ -285,6 +339,18 @@ impl Client {
         input: &str,
     ) -> Result<String> {
         self.invoke(resource_uri, method, &selector_set(selectors), input)
+            .await
+    }
+
+    /// [`Client::invoke_read`] with selectors given as pairs.
+    pub async fn call_read(
+        &self,
+        resource_uri: &str,
+        method: &str,
+        selectors: &[(&str, &str)],
+        input: &str,
+    ) -> Result<String> {
+        self.invoke_read(resource_uri, method, &selector_set(selectors), input)
             .await
     }
 }
@@ -465,6 +531,17 @@ mod tests {
             Some("The specified resource is not supported. a:Sender")
         );
         assert!(fault_reason(REDIR).is_none());
+    }
+
+    #[test]
+    fn endpoint_debug_hides_the_password() {
+        let ep = Endpoint::new("192.0.2.10", "admin", "hunter2!X");
+        let shown = format!("{ep:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(
+            shown.contains("192.0.2.10") && shown.contains("admin"),
+            "{shown}"
+        );
     }
 
     #[test]

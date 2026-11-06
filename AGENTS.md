@@ -68,6 +68,14 @@ the examples before a tool depends on them. Tests run against `amt-fake`.
 - Read `get_status` before proposing a write, and confirm with the user before `power`.
 - Passwords are read only from files whose path is configured or passed; no tool takes a
   password as an argument.
+- Mutating WS-Man calls (Put, Delete, any method that changes state) are never retried
+  once they may have reached the device: a resent `RequestPowerStateChange` is a second
+  reset, a resent `SendOptInCode` counts toward the lockout. Only read-only calls retry.
+- Sizes, lengths and counts read from the device are bounded before they size an
+  allocation or index a buffer, and arithmetic on them is checked. A device or anything
+  on the path to it can send anything.
+- Plaintext redirection authentication (auth type 1, the password in clear on 16994)
+  needs an explicit opt-in; by default only digest is accepted.
 - When a new failure mode or a step that needs a person at the device turns up, add it
   to `docs/guides/`.
 - **No deployment details in this repo**: no hostnames, IPs, device models or serials,
@@ -79,8 +87,10 @@ the examples before a tool depends on them. Tests run against `amt-fake`.
 All commits must pass `prek run --all-files`:
 
 - `cargo fmt`
-- `cargo clippy --all-targets -- -D warnings`. **`#[allow]` escapes are refused**: fix the
-  lint instead
+- `cargo clippy --all-targets -- -D warnings`. Fix the lint where you can. Where a lint
+  is wrong for one site, put `#[expect(clippy::lint, reason = "…")]` on that site; a bare
+  `#[allow]` is still refused. Crate- or workspace-wide allows go in `[workspace.lints]`
+  with a comment giving the reason
 - `cargo test --all`
 - `typos`, TOML/YAML validation, markdownlint
 

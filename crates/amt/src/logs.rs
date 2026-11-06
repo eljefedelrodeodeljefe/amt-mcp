@@ -43,7 +43,7 @@ impl Device {
         let sel = [("Name", MESSAGE_LOG)];
         let xml = self
             .client()
-            .call(&uri, "PositionToFirstRecord", &sel, "")
+            .call_read(&uri, "PositionToFirstRecord", &sel, "")
             .await?;
         let mut id =
             field(&xml, "IterationIdentifier").ok_or(Error::MissingField("IterationIdentifier"))?;
@@ -51,7 +51,7 @@ impl Device {
         for _ in 0..16 {
             let xml = self
                 .client()
-                .call(
+                .call_read(
                     &uri,
                     "GetRecords",
                     &sel,
@@ -83,7 +83,7 @@ impl Device {
         for _ in 0..64 {
             let xml = self
                 .client()
-                .call(
+                .call_read(
                     &uri,
                     "ReadRecords",
                     &sel,
@@ -97,10 +97,12 @@ impl Device {
                     out.push(r);
                 }
             }
-            if got == 0 || start + got > total {
-                break;
+            // `got` comes from the device: a count that would run the index
+            // past u32 ends the paging instead of overflowing.
+            match start.checked_add(got) {
+                Some(next) if got != 0 && next <= total => start = next,
+                _ => break,
             }
-            start += got;
         }
         Ok(out)
     }

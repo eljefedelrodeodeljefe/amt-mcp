@@ -45,8 +45,7 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 | Variable | Default | |
 | --- | --- | --- |
 | `AMT_HOST` | — | Device address (AMT shares the host OS's IP in DHCP mode) |
-| `AMT_PASSWORD_FILE` | — | File holding the AMT admin password (preferred) |
-| `AMT_PASSWORD` | — | The password itself, if no file is given |
+| `AMT_PASSWORD_FILE` | — | File holding the AMT admin password. Passwords are read only from files; a set `AMT_PASSWORD` stops the server |
 | `AMT_USER` | `admin` | |
 | `AMT_PORT` | `16992` | WS-Man (HTTP digest) |
 | `AMT_SOL_PORT` | `16994` | Redirection protocol |
@@ -55,6 +54,10 @@ Write tools (✓) are refused unless `AMT_ALLOW_WRITES=true`.
 | `AMT_KVM_TRANSPORT` | `redirection` | KVM inside a redirection session on 16994, or `vnc` for port 5900 |
 | `AMT_RFB_PASSWORD_FILE` | — | RFB password, only for `AMT_KVM_TRANSPORT=vnc` |
 | `AMT_ALLOW_WRITES` | `false` | Must be `true` for anything that changes state |
+| `AMT_ALLOW_PLAINTEXT_AUTH` | `false` | Let redirection (SOL, IDE-R, KVM) send the password in clear when a device offers no digest |
+
+Boolean variables take `true`/`false`, `1`/`0` or `yes`/`no` in any case. Anything else
+(`on`, an empty value) stops the server at startup with an error naming the variable.
 
 ```json
 {
@@ -108,6 +111,9 @@ Power actions, reads and clearing a boot override need no consent.
 
 - Plain-HTTP AMT (16992/16994) carries digest-protected credentials but unencrypted
   traffic. Expose these ports only to management hosts.
+- Redirection sessions use digest only. A device that offers just plaintext
+  authentication (old firmware, or someone on the path stripping digest from the
+  offer) is refused unless `AMT_ALLOW_PLAINTEXT_AUTH=true`.
 - `power` is equivalent to the physical power button. Confirm before using it.
 
 ## Development

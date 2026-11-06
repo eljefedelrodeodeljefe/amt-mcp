@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use amt::{Client, Device, Endpoint, IderSession, KvmSession, SolSession};
+use amt::{Client, Device, Endpoint, IderSession, KvmSession, Secret, SolSession};
 use anyhow::Context;
 use base64::Engine;
 use rmcp::{
@@ -17,8 +17,10 @@ use rmcp::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::config::{self, read_secret};
 use crate::error::tool_error;
 use crate::guides;
+use crate::logging;
 use crate::params::*;
 use crate::tools;
 
@@ -37,7 +39,7 @@ pub struct AmtServer {
     /// KVM over the redirection port (default) or the VNC port 5900.
     kvm_over_vnc: bool,
     /// The RFB password set by kvm_enable, or read from AMT_RFB_PASSWORD_FILE.
-    rfb_password: Mutex<Option<String>>,
+    rfb_password: Mutex<Option<Secret>>,
     ider: Mutex<Option<IderSession>>,
 }
 
@@ -45,29 +47,23 @@ impl AmtServer {
     pub fn from_env() -> anyhow::Result<Self> {
         let host = std::env::var("AMT_HOST").context("AMT_HOST not set")?;
         let user = std::env::var("AMT_USER").unwrap_or_else(|_| "admin".into());
-        let password = match (
-            std::env::var("AMT_PASSWORD_FILE"),
-            std::env::var("AMT_PASSWORD"),
-        ) {
-            (Ok(path), _) => std::fs::read_to_string(&path)
-                .with_context(|| format!("reading AMT_PASSWORD_FILE {path}"))?
-                .trim_end_matches(['\r', '\n'])
-                .to_string(),
-            (Err(_), Ok(p)) => p,
-            _ => anyhow::bail!("set AMT_PASSWORD_FILE (preferred) or AMT_PASSWORD"),
-        };
+        let password = config::admin_password(|k| std::env::var(k).ok())?;
         let timeout_ms: u64 = std::env::var("AMT_TIMEOUT_MS")
             .unwrap_or_else(|_| "15000".into())
             .parse()
             .context("AMT_TIMEOUT_MS must be a whole number of milliseconds")?;
         let port = env_port("AMT_PORT", amt::wsman::DEFAULT_PORT)?;
         let sol_port = env_port("AMT_SOL_PORT", amt::sol::DEFAULT_PORT)?;
-        let writes_enabled = std::env::var("AMT_ALLOW_WRITES")
-            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
-            .unwrap_or(false);
+        let writes_enabled = config::bool_env("AMT_ALLOW_WRITES", false)?;
 
         let mut ep = Endpoint::new(host.clone(), user, password);
         ep.port = port;
+        ep.allow_plaintext_auth = config::bool_env("AMT_ALLOW_PLAINTEXT_AUTH", false)?;
+        if ep.allow_plaintext_auth {
+            tracing::warn!(
+                "AMT_ALLOW_PLAINTEXT_AUTH is set: a device that offers only plaintext redirection auth gets the admin password in clear"
+            );
+        }
         ep.timeout = Duration::from_millis(timeout_ms);
         let timeout = ep.timeout;
         let reader = match (
@@ -75,10 +71,7 @@ impl AmtServer {
             std::env::var("AMT_READ_PASSWORD_FILE"),
         ) {
             (Ok(u), Ok(path)) => {
-                let p = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading AMT_READ_PASSWORD_FILE {path}"))?
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string();
+                let p = read_secret(&path, "AMT_READ_PASSWORD_FILE")?;
                 let mut r = Endpoint::new(host, u, p);
                 r.port = port;
                 r.timeout = timeout;
@@ -149,7 +142,7 @@ impl AmtServer {
                         None,
                     )
                 })?;
-                KvmSession::open(&ep.host, amt::kvm::VNC_PORT, &pw, self.timeout).await
+                KvmSession::open(&ep.host, amt::kvm::VNC_PORT, pw.expose(), self.timeout).await
             } else {
                 KvmSession::open_redirection(ep, self.sol_port, self.timeout).await
             }
@@ -273,9 +266,9 @@ impl AmtServer {
     )]
     async fn sync_clock(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::sync_clock(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::sync_clock(&self.device).await;
+        logging::write_tool("sync_clock", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -287,9 +280,13 @@ impl AmtServer {
         Parameters(p): Parameters<AddAlarmParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::add_alarm(&self.device, &p)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::add_alarm(&self.device, &p).await;
+        logging::write_tool(
+            "add_alarm",
+            &format!("name={} start={}", p.name, p.start),
+            &res,
+        );
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -299,9 +296,9 @@ impl AmtServer {
         Parameters(p): Parameters<AlarmNameParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::delete_alarm(&self.device, &p.name)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::delete_alarm(&self.device, &p.name).await;
+        logging::write_tool("delete_alarm", &format!("name={}", p.name), &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -313,9 +310,13 @@ impl AmtServer {
         Parameters(p): Parameters<AddAccountParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::add_account(&self.device, &p)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::add_account(&self.device, &p).await;
+        logging::write_tool(
+            "add_account",
+            &format!("user={} realms={:?}", p.user, p.realms),
+            &res,
+        );
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -327,9 +328,9 @@ impl AmtServer {
         Parameters(p): Parameters<AccountHandleParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::remove_account(&self.device, p.handle)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::remove_account(&self.device, p.handle).await;
+        logging::write_tool("remove_account", &format!("handle={}", p.handle), &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -343,9 +344,13 @@ impl AmtServer {
         Parameters(p): Parameters<NextBootParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::set_next_boot(&self.device, &p)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::set_next_boot(&self.device, &p).await;
+        logging::write_tool(
+            "set_next_boot",
+            &format!("target={:?} sol={:?}", p.target, p.sol),
+            &res,
+        );
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -385,9 +390,9 @@ impl AmtServer {
         Parameters(p): Parameters<PowerParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::power(&self.device, p.action)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::power(&self.device, p.action).await;
+        logging::write_tool("power", &format!("action={:?}", p.action), &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -398,9 +403,9 @@ impl AmtServer {
     )]
     async fn consent_request(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::consent_request(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::consent_request(&self.device).await;
+        logging::write_tool("consent_request", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -412,9 +417,9 @@ impl AmtServer {
         Parameters(p): Parameters<ConsentCodeParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::consent_submit(&self.device, &p.code)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::consent_submit(&self.device, &p.code).await;
+        logging::write_tool("consent_submit", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -423,9 +428,9 @@ impl AmtServer {
     )]
     async fn consent_cancel(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::consent_cancel(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::consent_cancel(&self.device).await;
+        logging::write_tool("consent_cancel", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -436,9 +441,9 @@ impl AmtServer {
     )]
     async fn enable_sol_listener(&self) -> Result<CallToolResult, ErrorData> {
         self.guard_write()?;
-        let data = tools::device::enable_sol_listener(&self.device)
-            .await
-            .map_err(tool_error)?;
+        let res = tools::device::enable_sol_listener(&self.device).await;
+        logging::write_tool("enable_sol_listener", "", &res);
+        let data = res.map_err(tool_error)?;
         Ok(Self::ok(&data))
     }
 
@@ -455,10 +460,10 @@ impl AmtServer {
                 &serde_json::json!({ "open": true, "reused": true }),
             ));
         }
-        let session =
-            SolSession::open(self.device.client().endpoint(), self.sol_port, self.timeout)
-                .await
-                .map_err(|e| tool_error(e.into()))?;
+        let res =
+            SolSession::open(self.device.client().endpoint(), self.sol_port, self.timeout).await;
+        logging::write_tool("sol_open", "", &res);
+        let session = res.map_err(|e| tool_error(e.into()))?;
         *slot = Some(session);
         Ok(Self::ok(
             &serde_json::json!({ "open": true, "reused": false }),
@@ -515,19 +520,17 @@ impl AmtServer {
         let state = match &p.rfb_password_file {
             Some(path) => {
                 let pw = read_secret(path, "rfb_password_file").map_err(tool_error)?;
-                let state = self
-                    .device
-                    .enable_kvm(&pw)
-                    .await
-                    .map_err(|e| tool_error(e.into()))?;
+                let res = self.device.enable_kvm(pw.expose()).await;
+                logging::write_tool("kvm_enable", "port_5900=true", &res);
+                let state = res.map_err(|e| tool_error(e.into()))?;
                 *self.rfb_password.lock().await = Some(pw);
                 state
             }
-            None => self
-                .device
-                .enable_kvm_service()
-                .await
-                .map_err(|e| tool_error(e.into()))?,
+            None => {
+                let res = self.device.enable_kvm_service().await;
+                logging::write_tool("kvm_enable", "port_5900=unchanged", &res);
+                res.map_err(|e| tool_error(e.into()))?
+            }
         };
         Ok(Self::ok(&serde_json::to_value(state).unwrap_or_default()))
     }
@@ -540,11 +543,9 @@ impl AmtServer {
         if let Some(k) = self.kvm.lock().await.take() {
             k.close().await;
         }
-        let state = self
-            .device
-            .disable_kvm()
-            .await
-            .map_err(|e| tool_error(e.into()))?;
+        let res = self.device.disable_kvm().await;
+        logging::write_tool("kvm_disable", "", &res);
+        let state = res.map_err(|e| tool_error(e.into()))?;
         Ok(Self::ok(&serde_json::to_value(state).unwrap_or_default()))
     }
 
@@ -623,15 +624,21 @@ impl AmtServer {
                 None,
             ));
         }
-        let session = IderSession::open(
+        let start = p.start.unwrap_or(amt::IderStart::OnReboot);
+        let res = IderSession::open(
             self.device.client().endpoint(),
             self.sol_port,
             std::path::Path::new(&p.iso_path),
-            p.start.unwrap_or(amt::IderStart::OnReboot),
+            start,
             self.timeout,
         )
-        .await
-        .map_err(|e| tool_error(e.into()))?;
+        .await;
+        logging::write_tool(
+            "ider_start",
+            &format!("iso={} start={start:?}", p.iso_path),
+            &res,
+        );
+        let session = res.map_err(|e| tool_error(e.into()))?;
         let status = session.status().await;
         *slot = Some(session);
         Ok(Self::ok(&serde_json::to_value(status).unwrap_or_default()))
@@ -723,10 +730,11 @@ impl ServerHandler for AmtServer {
 const INSTRUCTIONS: &str = concat!(
     "Intel AMT out-of-band management over WS-Man (HTTP digest, port 16992) and the ",
     "redirection protocol (Serial-over-LAN, port 16994). Configure with AMT_HOST and ",
-    "AMT_PASSWORD_FILE (or AMT_PASSWORD). Optional: AMT_USER (default admin), AMT_PORT, ",
+    "AMT_PASSWORD_FILE (a file holding the admin password). Optional: AMT_USER (default admin), AMT_PORT, ",
     "AMT_SOL_PORT, AMT_TIMEOUT_MS (default 15000), AMT_READ_USER + AMT_READ_PASSWORD_FILE ",
-    "(a least-privilege account used for read tools), AMT_KVM_TRANSPORT (redirection or vnc), AMT_RFB_PASSWORD_FILE (KVM over vnc), AMT_ALLOW_WRITES (default false — must ",
-    "be 'true' for power, consent and console tools). ",
+    "(a least-privilege account used for read tools), AMT_KVM_TRANSPORT (redirection or vnc), AMT_RFB_PASSWORD_FILE (KVM over vnc), AMT_ALLOW_PLAINTEXT_AUTH (default false; lets SOL, IDE-R and KVM fall back to sending the password in clear when a device offers no digest), AMT_ALLOW_WRITES (default false — must ",
+    "be 'true' for power, consent and console tools; true/false, 1/0 or yes/no, anything else ",
+    "stops the server). ",
     "Power actions are immediate and bypass the OS. In client control mode every SOL, ",
     "IDE-R or KVM session needs a 6-digit consent code that only someone at the device's ",
     "display can read: call consent_request, ask the user for the code, then ",
@@ -734,13 +742,6 @@ const INSTRUCTIONS: &str = concat!(
     "Operator guides (setup incl. steps that need a human, security, recipes, troubleshooting): ",
     "list_guides / get_guide, also as resources amt://guide/<name>.",
 );
-
-fn read_secret(path: &str, what: &str) -> anyhow::Result<String> {
-    Ok(std::fs::read_to_string(path)
-        .with_context(|| format!("reading {what} {path}"))?
-        .trim_end_matches(['\r', '\n'])
-        .to_string())
-}
 
 fn env_port(key: &str, default: u16) -> anyhow::Result<u16> {
     match std::env::var(key) {

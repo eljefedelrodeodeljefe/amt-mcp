@@ -101,15 +101,12 @@ pub async fn add_account(
     dev: &Device,
     p: &crate::params::AddAccountParams,
 ) -> anyhow::Result<Value> {
-    let password = std::fs::read_to_string(&p.password_file)
-        .map_err(|e| anyhow::anyhow!("reading password_file: {e}"))?
-        .trim_end_matches(['\r', '\n'])
-        .to_string();
+    let password = crate::config::read_secret(&p.password_file, "password_file")?;
     let realms = p
         .realms
         .clone()
         .unwrap_or_else(|| amt::READ_ONLY_REALMS.to_vec());
-    let handle = dev.add_account(&p.user, &password, &realms).await?;
+    let handle = dev.add_account(&p.user, password.expose(), &realms).await?;
     Ok(json!({ "handle": handle, "user": p.user, "realms": realms }))
 }
 

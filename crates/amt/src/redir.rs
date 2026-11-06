@@ -143,7 +143,7 @@ async fn start_and_authenticate(
         let resp = DigestInput {
             user: &ep.user,
             realm: &realm,
-            password: &ep.password,
+            password: ep.password.expose(),
             method: "POST",
             uri: AUTH_URI,
             nonce: &nonce,
@@ -170,8 +170,16 @@ async fn start_and_authenticate(
         }
         w.send(&f).await?;
     } else if supported.contains(&auth::PASSWORD) {
-        // 3b. Only for old firmware that offers nothing better.
-        let (user, pass) = (ep.user.as_bytes(), ep.password.as_bytes());
+        // 3b. Only for old firmware that offers nothing better, and only when
+        // asked for: an offer without digest may be a downgrade on the path.
+        if !ep.allow_plaintext_auth {
+            return Err(Error::PlaintextAuthRefused);
+        }
+        tracing::warn!(
+            host = %ep.host,
+            "redirection: device offers only plaintext authentication; sending the password in clear"
+        );
+        let (user, pass) = (ep.user.as_bytes(), ep.password.expose().as_bytes());
         let mut f = vec![msg::AUTHENTICATE, 0, 0, 0, auth::PASSWORD];
         f.extend_from_slice(&((user.len() + pass.len() + 2) as u32).to_le_bytes());
         push_str(&mut f, user);
