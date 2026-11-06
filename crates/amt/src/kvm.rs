@@ -155,8 +155,11 @@ struct PixelFormat {
 }
 
 impl PixelFormat {
-    fn parse(b: &[u8]) -> Self {
-        Self {
+    /// Parses the 16-byte RFB PIXEL_FORMAT. Refuses what RFB does not allow
+    /// (bits per pixel other than 8, 16 or 32) and true-colour shifts that
+    /// point past the pixel, which would otherwise overflow `v >> shift`.
+    fn parse(b: &[u8]) -> Result<Self> {
+        let f = Self {
             bpp: b[0],
             big_endian: b[2] != 0,
             true_colour: b[3] != 0,
@@ -166,7 +169,20 @@ impl PixelFormat {
                 u16::from_be_bytes([b[8], b[9]]),
             ],
             shift: [b[10], b[11], b[12]],
+        };
+        if !matches!(f.bpp, 8 | 16 | 32) {
+            return Err(Error::Protocol(format!(
+                "RFB pixel format with {} bits per pixel; only 8, 16 or 32 are valid",
+                f.bpp
+            )));
         }
+        if f.true_colour && f.shift.iter().any(|&s| s >= f.bpp) {
+            return Err(Error::Protocol(format!(
+                "RFB pixel format shifts {:?} reach past a {}-bit pixel",
+                f.shift, f.bpp
+            )));
+        }
+        Ok(f)
     }
 
     fn bytes_per_pixel(&self) -> usize {
@@ -318,7 +334,7 @@ impl KvmSession {
         let height = u16::from_be_bytes([init[2], init[3]]);
         // Keep AMT's native pixel format (16-bit RGB565 on AMT 12): AMT does
         // not accept every SetPixelFormat a client might ask for.
-        let format = PixelFormat::parse(&init[4..20]);
+        let format = PixelFormat::parse(&init[4..20])?;
         check_framebuffer(width as usize, height as usize, format.bytes_per_pixel())?;
         let name_len = u32::from_be_bytes([init[20], init[21], init[22], init[23]]) as usize;
         let mut name = vec![0u8; name_len.min(4096)];
@@ -746,6 +762,41 @@ mod tests {
         .expect("open");
         let err = kvm.screenshot().await.expect_err("refused");
         assert!(err.to_string().contains("over the limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pixel_shift_past_the_pixel_is_refused() {
+        // A shift of 40 would panic in `v >> shift` on the first pixel.
+        let mut after = update(0, 0, 1, 1, 0);
+        after.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let r = fake_rfb(1, 1, pixel_format(32, [255; 3], [40, 8, 0]), after).await;
+        let mut kvm = match r {
+            Err(e) => {
+                assert!(e.to_string().contains("pixel format"), "{e}");
+                return;
+            }
+            Ok(kvm) => kvm,
+        };
+        let res = kvm.screenshot().await;
+        panic!(
+            "pixel format with shift 40 accepted: {:?}",
+            res.map(|p| p.len())
+        );
+    }
+
+    #[test]
+    fn pixel_format_rules() {
+        let (max, shift) = RGB565;
+        assert!(PixelFormat::parse(&pixel_format(16, max, shift)).is_ok());
+        assert!(PixelFormat::parse(&pixel_format(32, [255; 3], [16, 8, 0])).is_ok());
+        assert!(PixelFormat::parse(&pixel_format(16, max, [16, 5, 0])).is_err());
+        assert!(PixelFormat::parse(&pixel_format(32, [255; 3], [32, 8, 0])).is_err());
+        assert!(PixelFormat::parse(&pixel_format(24, [255; 3], [16, 8, 0])).is_err());
+        assert!(PixelFormat::parse(&pixel_format(0, max, shift)).is_err());
+        // Palette formats carry no shifts to check.
+        let mut indexed = pixel_format(8, [0; 3], [200, 200, 200]);
+        indexed[3] = 0;
+        assert!(PixelFormat::parse(&indexed).is_ok());
     }
 
     #[test]
